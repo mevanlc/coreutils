@@ -21,12 +21,14 @@ categories.workspace = true
 all-features = true
 
 [features]
-default = ["feat_common_core"]
+default = ["bracket-alias", "feat_common_core"]
 ## OS feature shortcodes
 macos = ["feat_os_macos"]
 unix = ["feat_os_unix"]
 windows = ["feat_os_windows"]
 ## project-specific feature shortcodes
+# Include `[` as an alias for `test` in the multi-call binary.
+bracket-alias = ["test"]
 expensive_tests = []
 # "test_risky_names" == enable tests that create problematic file names (would make a network share inaccessible to Windows, breaks SVN on Mac OS, etc.)
 test_risky_names = []

@@ -15,6 +15,8 @@ pub fn main() {
     const FEATURE_PREFIX: &str = "feat_";
     const OVERRIDE_PREFIX: &str = "uu_";
 
+    let bracket_alias_enabled = env::var_os("CARGO_FEATURE_BRACKET_ALIAS").is_some();
+
     // Do not rebuild build script unless the script itself or the enabled features are modified
     // See <https://doc.rust-lang.org/cargo/reference/build-scripts.html#change-detection>
     println!("cargo:rerun-if-changed=build.rs");
@@ -49,7 +51,7 @@ pub fn main() {
                 "nightly" | "test_unimplemented" | "expensive_tests" | "test_risky_names" => {
                     continue;
                 } // crate-local custom features
-                "uudoc" => continue, // is not a utility
+                "bracket_alias" | "uudoc" => continue, // these are not utilities
                 "test" => continue, // over-ridden with 'uu_test' to avoid collision with rust core crate 'test'
                 s if s.starts_with(FEATURE_PREFIX) => continue, // crate feature sets
                 _ => {}             // util feature name
@@ -78,10 +80,13 @@ pub fn main() {
         let map_value = format!("({krate}::uumain, {krate}::uu_app)");
         match krate.as_ref() {
             // 'test' is named uu_test to avoid collision with rust core crate 'test'.
-            // It can also be invoked by name '[' for the '[ expr ] syntax'.
+            // With the bracket-alias feature, it can also be invoked by name '['
+            // for the '[ expr ] syntax'.
             "uu_test" => {
                 entries.push(("test", map_value.clone()));
-                entries.push(("[", map_value.clone()));
+                if bracket_alias_enabled {
+                    entries.push(("[", map_value.clone()));
+                }
             }
             k if k.starts_with(OVERRIDE_PREFIX) => {
                 entries.push((&k[OVERRIDE_PREFIX.len()..], map_value.clone()));

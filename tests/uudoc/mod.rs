@@ -106,6 +106,33 @@ fn test_completion_generation() {
     );
 }
 
+#[test]
+#[cfg(not(feature = "bracket-alias"))]
+fn test_coreutils_zsh_completion_without_bracket_alias() {
+    let output = get_uudoc_command()
+        .arg("completion")
+        .arg("coreutils")
+        .arg("zsh")
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(
+        output.status.success(),
+        "Command failed with status: {}",
+        output.status
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "stderr should be empty but got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    assert!(output_str.contains("(test)"), "{output_str}");
+    assert!(!output_str.contains("\n            ([)\n"), "{output_str}");
+    assert!(!output_str.contains("__subcmd__[_commands"), "{output_str}");
+}
+
 // Prevent regression to:
 //
 // ❯ uudoc manpage base64 | rg --fixed-strings -- 'base32'

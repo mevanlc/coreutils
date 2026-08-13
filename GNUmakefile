@@ -6,6 +6,7 @@ ifneq (,$(filter install, $(MAKECMDGOALS)))
 endif
 PROFILE         ?= debug
 MULTICALL       ?= n
+BRACKET_ALIAS   ?= y
 COMPLETIONS     ?= y
 MANPAGES        ?= y
 LOCALES         ?= y
@@ -106,6 +107,13 @@ endif
 
 UTILS ?= $(filter-out $(SKIP_UTILS),$(PROGS))
 
+BRACKET_ALIAS_FEATURE :=
+ifeq ($(BRACKET_ALIAS),y)
+ifneq (,$(filter test,$(UTILS)))
+BRACKET_ALIAS_FEATURE := bracket-alias
+endif
+endif
+
 ifneq ($(findstring stdbuf,$(UTILS)),)
     # Use external libstdbuf per default. It is more robust than embedding libstdbuf.
 	CARGOFLAGS += --features feat_external_libstdbuf
@@ -153,7 +161,7 @@ endif
 endif
 
 build-coreutils:
-	${CARGO} build ${CARGOFLAGS} --features "${EXES} $(BUILD_SPEC_FEATURE)" ${PROFILE_CMD} --no-default-features
+	${CARGO} build ${CARGOFLAGS} --features "${EXES} $(BUILD_SPEC_FEATURE) $(BRACKET_ALIAS_FEATURE)" ${PROFILE_CMD} --no-default-features
 
 ifeq (${MULTICALL}, y)
 build: build-coreutils locales
@@ -164,10 +172,10 @@ endif
 $(foreach test,$(UTILS),$(eval $(call TEST_BUSYBOX,$(test))))
 
 test:
-	${CARGO} test ${CARGOFLAGS} --features "$(TESTS) $(TEST_SPEC_FEATURE)" $(PROFILE_CMD) --no-default-features $(TEST_NO_FAIL_FAST)
+	${CARGO} test ${CARGOFLAGS} --features "$(TESTS) $(TEST_SPEC_FEATURE) $(BRACKET_ALIAS_FEATURE)" $(PROFILE_CMD) --no-default-features $(TEST_NO_FAIL_FAST)
 
 nextest:
-	${CARGO} nextest run ${CARGOFLAGS} --features "$(TESTS) $(TEST_SPEC_FEATURE)" $(PROFILE_CMD) --no-default-features $(TEST_NO_FAIL_FAST)
+	${CARGO} nextest run ${CARGOFLAGS} --features "$(TESTS) $(TEST_SPEC_FEATURE) $(BRACKET_ALIAS_FEATURE)" $(PROFILE_CMD) --no-default-features $(TEST_NO_FAIL_FAST)
 
 test_toybox:
 	-(cd $(TOYBOX_SRC)/ && make tests)
@@ -216,7 +224,7 @@ distclean: clean
 ifeq ($(MANPAGES),y)
 # Do not cross-build uudoc
 build-uudoc:
-	@unset CARGO_BUILD_TARGET && ${CARGO} build ${CARGOFLAGS} --bin uudoc --features "uudoc ${EXES}" ${PROFILE_CMD} --no-default-features
+	@unset CARGO_BUILD_TARGET && ${CARGO} build ${CARGOFLAGS} --bin uudoc --features "uudoc ${EXES} $(BRACKET_ALIAS_FEATURE)" ${PROFILE_CMD} --no-default-features
 
 install-manpages: build-uudoc
 	mkdir -p $(DESTDIR)$(DATAROOTDIR)/man/man1
@@ -299,7 +307,9 @@ ifeq (${MULTICALL}, y)
 	$(foreach prog, $(filter-out coreutils, $(INSTALLEES)), \
 		cd $(INSTALLDIR_BIN) && $(LN) $(PROG_PREFIX)coreutils $(PROG_PREFIX)$(prog) $(newline) \
 	)
-	$(if $(findstring test,$(INSTALLEES)), cd $(INSTALLDIR_BIN) && $(LN) $(PROG_PREFIX)coreutils $(PROG_PREFIX)[)
+ifeq ($(BRACKET_ALIAS),y)
+	$(if $(filter test,$(INSTALLEES)), cd $(INSTALLDIR_BIN) && $(LN) $(PROG_PREFIX)coreutils $(PROG_PREFIX)[)
+endif
 else
 	$(foreach prog, $(INSTALLEES), \
 		$(INSTALL) -m 755 $(BUILDDIR)/$(prog) $(INSTALLDIR_BIN)/$(PROG_PREFIX)$(prog) $(newline) \

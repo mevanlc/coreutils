@@ -132,6 +132,31 @@ example:
 cargo build --features "base32 cat echo rm" --no-default-features
 ```
 
+This fork keeps the multi-call `[` alias behind the default `bracket-alias`
+feature. Cargo features are additive, so omit the alias by disabling the default
+features and enabling the desired utility set explicitly. For example, on
+macOS:
+
+```shell
+cargo build --no-default-features --features macos
+```
+
+This retains the `test` utility while removing the `coreutils [` entry from the
+multi-call binary and its generated completions. The standalone `test` binary is
+unchanged. Add `bracket-alias` to the feature list to opt back in. The equivalent
+GNU Make setting for a multi-call build is:
+
+```shell
+make MULTICALL=y BRACKET_ALIAS=n
+```
+
+To generate usable zsh completion for that multi-call configuration:
+
+```shell
+cargo run --no-default-features --features macos,uudoc \
+  --bin uudoc -- completion coreutils zsh
+```
+
 If you want to build the utilities as individual binaries, that is also possible:
 
 ```shell

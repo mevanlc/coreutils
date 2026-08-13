@@ -249,3 +249,20 @@ fn test_sorted_utils() {
     .unwrap();
     assert!(out.lines().filter(|s| !s.is_empty()).is_sorted());
 }
+
+#[test]
+#[cfg(feature = "test")]
+fn bracket_alias_matches_feature() {
+    let scenario = TestScenario::new("bracket_alias");
+    let output = std::process::Command::new(&scenario.bin_path)
+        .arg("--list")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let utilities = stdout.lines().collect::<Vec<_>>();
+
+    assert!(utilities.contains(&"test"));
+    assert_eq!(utilities.contains(&"["), cfg!(feature = "bracket-alias"));
+}
