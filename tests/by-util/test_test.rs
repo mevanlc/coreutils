@@ -903,6 +903,7 @@ fn test_string_length_and_nothing() {
 }
 
 #[test]
+#[cfg(feature = "bracket-alias")]
 fn test_bracket_syntax_success() {
     let scenario = TestScenario::new("[");
     let mut ucmd = scenario.ucmd();
@@ -911,6 +912,7 @@ fn test_bracket_syntax_success() {
 }
 
 #[test]
+#[cfg(feature = "bracket-alias")]
 fn test_bracket_syntax_failure() {
     let scenario = TestScenario::new("[");
     let mut ucmd = scenario.ucmd();
@@ -919,6 +921,7 @@ fn test_bracket_syntax_failure() {
 }
 
 #[test]
+#[cfg(feature = "bracket-alias")]
 fn test_bracket_syntax_missing_right_bracket() {
     let scenario = TestScenario::new("[");
     let mut ucmd = scenario.ucmd();
@@ -930,6 +933,7 @@ fn test_bracket_syntax_missing_right_bracket() {
 }
 
 #[test]
+#[cfg(feature = "bracket-alias")]
 fn test_bracket_syntax_help() {
     let scenario = TestScenario::new("[");
     let mut ucmd = scenario.ucmd();
@@ -938,6 +942,7 @@ fn test_bracket_syntax_help() {
 }
 
 #[test]
+#[cfg(feature = "bracket-alias")]
 fn test_bracket_syntax_version() {
     let scenario = TestScenario::new("[");
     let mut ucmd = scenario.ucmd();
