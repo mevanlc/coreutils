@@ -3373,4 +3373,231 @@ sort: invalid number at field start: invalid count at start of 'sort'
     }
 }
 
+#[test]
+fn test_color_flag_parsing() {
+    // --color=always enables color in debug mode
+    new_ucmd!()
+        .args(&["-s", "-k2b,2", "--debug", "--color=always"])
+        .pipe_in("foo bar\n")
+        .succeeds()
+        .stdout_is("\x1b[90mfoo \x1b[42mbar\x1b[0m\n");
+
+    // --color (without value) implies always
+    new_ucmd!()
+        .args(&["-s", "-k2b,2", "--debug", "--color"])
+        .pipe_in("foo bar\n")
+        .succeeds()
+        .stdout_is("\x1b[90mfoo \x1b[42mbar\x1b[0m\n");
+
+    // aliases: yes, force
+    new_ucmd!()
+        .args(&["-s", "-k2b,2", "--debug", "--color=yes"])
+        .pipe_in("foo bar\n")
+        .succeeds()
+        .stdout_is("\x1b[90mfoo \x1b[42mbar\x1b[0m\n");
+    new_ucmd!()
+        .args(&["-s", "-k2b,2", "--debug", "--color=force"])
+        .pipe_in("foo bar\n")
+        .succeeds()
+        .stdout_is("\x1b[90mfoo \x1b[42mbar\x1b[0m\n");
+
+    // --color=never disables color (uses underline lines)
+    new_ucmd!()
+        .args(&["-s", "-k2b,2", "--debug", "--color=never"])
+        .pipe_in("foo bar\n")
+        .succeeds()
+        .stdout_is("foo bar\n    ___\n");
+
+    // aliases: no, none
+    new_ucmd!()
+        .args(&["-s", "-k2b,2", "--debug", "--color=no"])
+        .pipe_in("foo bar\n")
+        .succeeds()
+        .stdout_is("foo bar\n    ___\n");
+    new_ucmd!()
+        .args(&["-s", "-k2b,2", "--debug", "--color=none"])
+        .pipe_in("foo bar\n")
+        .succeeds()
+        .stdout_is("foo bar\n    ___\n");
+
+    // --color=auto (or default without --color) in non-tty pipe disables color
+    new_ucmd!()
+        .args(&["-s", "-k2b,2", "--debug", "--color=auto"])
+        .pipe_in("foo bar\n")
+        .succeeds()
+        .stdout_is("foo bar\n    ___\n");
+    new_ucmd!()
+        .args(&["-s", "-k2b,2", "--debug"])
+        .pipe_in("foo bar\n")
+        .succeeds()
+        .stdout_is("foo bar\n    ___\n");
+
+    // Invalid value fails
+    new_ucmd!().args(&["--color=invalid"]).fails().code_is(1);
+}
+
+#[test]
+fn test_debug_color_fallback_active() {
+    // When fallback sort is active (no -s), whole line participates in fallback sort (normal FG),
+    // and key ranges get background colors.
+    new_ucmd!()
+        .args(&["-k2b,2", "--debug", "--color=always"])
+        .pipe_in("foo bar\n")
+        .succeeds()
+        .stdout_is("foo \x1b[42mbar\x1b[0m\n");
+
+    // Key without -b includes leading blanks in the key range
+    new_ucmd!()
+        .args(&["-k2,2", "--debug", "--color=always"])
+        .pipe_in("foo bar\n")
+        .succeeds()
+        .stdout_is("foo\x1b[42m bar\x1b[0m\n");
+
+    // Multiple keys with fallback sort active
+    new_ucmd!()
+        .args(&["-k1,1", "-k2b,2", "--debug", "--color=always"])
+        .pipe_in("foo bar\n")
+        .succeeds()
+        .stdout_is("\x1b[42mfoo\x1b[0m \x1b[44mbar\x1b[0m\n");
+}
+
+#[test]
+fn test_debug_color_fallback_inactive() {
+    // When fallback sort is disabled (-s), text not participating in fallback sort gets FG color 90.
+    new_ucmd!()
+        .args(&["-s", "-k2b,2", "--debug", "--color=always"])
+        .pipe_in("foo bar\n")
+        .succeeds()
+        .stdout_is("\x1b[90mfoo \x1b[42mbar\x1b[0m\n");
+
+    // Key without -b includes leading whitespace
+    new_ucmd!()
+        .args(&["-s", "-k2,2", "--debug", "--color=always"])
+        .pipe_in("foo bar\n")
+        .succeeds()
+        .stdout_is("\x1b[90mfoo\x1b[42m bar\x1b[0m\n");
+
+    // Multiple keys with stable sort (-s)
+    new_ucmd!()
+        .args(&["-s", "-k1,1", "-k2b,2", "--debug", "--color=always"])
+        .pipe_in("foo bar\n")
+        .succeeds()
+        .stdout_is("\x1b[90;42mfoo\x1b[49m \x1b[44mbar\x1b[0m\n");
+}
+
+#[test]
+fn test_debug_color_cycle() {
+    // Background color cycle: 42 44 45 46 41 104 105 101
+    // 9 keys should cycle the 9th key back to 42.
+    let args = [
+        "-s",
+        "-k1b,1",
+        "-k2b,2",
+        "-k3b,3",
+        "-k4b,4",
+        "-k5b,5",
+        "-k6b,6",
+        "-k7b,7",
+        "-k8b,8",
+        "-k9b,9",
+        "--debug",
+        "--color=always",
+    ];
+    let input = "a b c d e f g h i\n";
+    let expected = concat!(
+        "\x1b[90;42ma\x1b[49m ",
+        "\x1b[44mb\x1b[49m ",
+        "\x1b[45mc\x1b[49m ",
+        "\x1b[46md\x1b[49m ",
+        "\x1b[41me\x1b[49m ",
+        "\x1b[104mf\x1b[49m ",
+        "\x1b[105mg\x1b[49m ",
+        "\x1b[101mh\x1b[49m ",
+        "\x1b[42mi\x1b[0m\n"
+    );
+
+    new_ucmd!()
+        .args(&args)
+        .pipe_in(input)
+        .succeeds()
+        .stdout_is(expected);
+
+    // Contiguous keys without -b transition directly between background colors
+    let args_contiguous = [
+        "-s",
+        "-k1,1",
+        "-k2,2",
+        "-k3,3",
+        "-k4,4",
+        "-k5,5",
+        "-k6,6",
+        "-k7,7",
+        "-k8,8",
+        "-k9,9",
+        "--debug",
+        "--color=always",
+    ];
+    let expected_contiguous = concat!(
+        "\x1b[90;42ma",
+        "\x1b[44m b",
+        "\x1b[45m c",
+        "\x1b[46m d",
+        "\x1b[41m e",
+        "\x1b[104m f",
+        "\x1b[105m g",
+        "\x1b[101m h",
+        "\x1b[42m i\x1b[0m\n"
+    );
+    new_ucmd!()
+        .args(&args_contiguous)
+        .pipe_in(input)
+        .succeeds()
+        .stdout_is(expected_contiguous);
+}
+
+#[test]
+fn test_debug_color_numeric_and_whitespace() {
+    // Numeric key in stable sort:
+    // Leading whitespace and trailing non-digits have FG 90, default BG.
+    // Matched number has FG 90, BG 42.
+    new_ucmd!()
+        .args(&["-s", "-k1n", "--debug", "--color=always"])
+        .pipe_in("  123abc\n")
+        .succeeds()
+        .stdout_is("\x1b[90m  \x1b[42m123\x1b[49mabc\x1b[0m\n");
+
+    // Numeric key with fallback sort:
+    // Leading whitespace and trailing non-digits have normal FG, default BG.
+    // Matched number has normal FG, BG 42.
+    new_ucmd!()
+        .args(&["-k1n", "--debug", "--color=always"])
+        .pipe_in("  123abc\n")
+        .succeeds()
+        .stdout_is("  \x1b[42m123\x1b[0mabc\n");
+}
+
+#[test]
+fn test_debug_color_empty_lines_and_tabs() {
+    // Empty line output in color debug
+    new_ucmd!()
+        .args(&["-s", "-k1,1", "--debug", "--color=always"])
+        .pipe_in("\n")
+        .succeeds()
+        .stdout_is("\n");
+
+    // Tab character rendered as > in debug output with explicit delimiter
+    new_ucmd!()
+        .args(&["-t\t", "-s", "-k2,2", "--debug", "--color=always"])
+        .pipe_in("a\tb\n")
+        .succeeds()
+        .stdout_is("\x1b[90ma>\x1b[42mb\x1b[0m\n");
+
+    // Tab as leading blank of field 2 in default whitespace delimiter
+    new_ucmd!()
+        .args(&["-s", "-k2,2", "--debug", "--color=always"])
+        .pipe_in("a\tb\n")
+        .succeeds()
+        .stdout_is("\x1b[90ma\x1b[42m>b\x1b[0m\n");
+}
+
 /* spell-checker: enable */

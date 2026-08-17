@@ -93,3 +93,4 @@ sort-help-compress-prog = compresse les fichiers temporaires avec PROG, décompr
 sort-help-batch-size = Fusionne au maximum N_MERGE entrées à la fois.
 sort-help-files0-from = lit l'entrée depuis les fichiers spécifiés par FICHIER_NUL terminé par NUL
 sort-help-debug = souligne les parties de la ligne qui sont réellement utilisées pour le tri
+sort-help-color = colorer la sortie ; QUAND peut être 'always', 'auto' ou 'never'
