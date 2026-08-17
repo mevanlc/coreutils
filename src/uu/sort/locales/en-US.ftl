@@ -108,3 +108,4 @@ sort-help-compress-prog = compress temporary files with PROG, decompress with PR
 sort-help-batch-size = Merge at most N_MERGE inputs at once.
 sort-help-files0-from = read input from the files specified by NUL-terminated NUL_FILE
 sort-help-debug = underline the parts of the line that are actually used for sorting
+sort-help-color = colorize the output; WHEN can be 'always', 'auto', or 'never'

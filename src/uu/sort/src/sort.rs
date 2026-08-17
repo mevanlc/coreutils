@@ -21,7 +21,7 @@ mod tmp_dir;
 
 use bigdecimal::BigDecimal;
 use chunks::LineData;
-use clap::builder::ValueParser;
+use clap::builder::{PossibleValue, ValueParser};
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use custom_str_cmp::custom_str_cmp;
 use ext_sort::ext_sort;
@@ -36,7 +36,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader, BufWriter, Read, Write, stdin, stdout};
+use std::io::{BufRead, BufReader, BufWriter, IsTerminal, Read, Write, stdin, stdout};
 use std::num::IntErrorKind;
 use std::ops::Range;
 use std::path::Path;
@@ -107,6 +107,7 @@ mod options {
     pub const COMPRESS_PROG: &str = "compress-program";
     pub const BATCH_SIZE: &str = "batch-size";
     pub const RANDOM_SOURCE: &str = "random-source";
+    pub const COLOR: &str = "color";
 
     pub const FILES: &str = "files";
 }
@@ -268,6 +269,7 @@ impl Output {
 pub struct GlobalSettings {
     mode: SortMode,
     debug: bool,
+    color: bool,
     ignore_leading_blanks: bool,
     ignore_case: bool,
     dictionary_order: bool,
@@ -441,6 +443,7 @@ impl Default for GlobalSettings {
         Self {
             mode: SortMode::Default,
             debug: false,
+            color: false,
             ignore_leading_blanks: false,
             ignore_case: false,
             dictionary_order: false,
@@ -709,6 +712,18 @@ impl<'a> Line<'a> {
         settings: &GlobalSettings,
         writer: &mut impl Write,
     ) -> std::io::Result<()> {
+        if settings.color {
+            self.write_debug_colored(settings, writer)
+        } else {
+            self.write_debug_uncolored(settings, writer)
+        }
+    }
+
+    fn write_debug_uncolored(
+        &self,
+        settings: &GlobalSettings,
+        writer: &mut impl Write,
+    ) -> std::io::Result<()> {
         // We do not consider this function performance critical, as debug output is only useful for small files,
         // which are not a performance problem in any case. Therefore there aren't any special performance
         // optimizations here.
@@ -731,82 +746,7 @@ impl<'a> Line<'a> {
             &settings.precomputed,
         );
         for selector in &settings.selectors {
-            let mut selection = selector.get_range(self.line, Some(&fields));
-            match selector.settings.mode {
-                SortMode::Numeric | SortMode::HumanNumeric => {
-                    // find out which range is used for numeric comparisons
-                    let mut parse_settings = settings
-                        .numeric_locale
-                        .num_info_settings(selector.settings.mode == SortMode::HumanNumeric);
-                    // Debug annotations should ignore thousands separators to match GNU output.
-                    parse_settings.thousands_separator = None;
-                    let (_, num_range) =
-                        NumInfo::parse(&self.line[selection.clone()], &parse_settings);
-                    let initial_selection = selection.clone();
-
-                    // Shorten selection to num_range.
-                    selection.start += num_range.start;
-                    selection.end = selection.start + num_range.len();
-
-                    if num_range == (0..0) {
-                        // This was not a valid number.
-                        // Report no match at the first non-whitespace character.
-                        let leading_whitespace = self.line[selection.clone()]
-                            .iter()
-                            .position(|c| !c.is_ascii_whitespace())
-                            .unwrap_or(0);
-                        selection.start += leading_whitespace;
-                        selection.end += leading_whitespace;
-                    } else {
-                        // include a trailing si unit
-                        if selector.settings.mode == SortMode::HumanNumeric
-                            && self.line[selection.end..initial_selection.end]
-                                .first()
-                                .is_some_and(|c| b"kKMGTPEZYRQ".contains(c))
-                        {
-                            selection.end += 1;
-                        }
-
-                        // include leading zeroes, a leading minus or a leading decimal point
-                        while self.line[initial_selection.start..selection.start]
-                            .last()
-                            .is_some_and(|c| b"-0.".contains(c))
-                        {
-                            selection.start -= 1;
-                        }
-                    }
-                }
-                SortMode::GeneralNumeric => {
-                    let initial_selection = &self.line[selection.clone()];
-                    let decimal_pt = locale_decimal_pt();
-                    let leading = get_leading_gen(initial_selection, decimal_pt);
-
-                    // Shorten selection to leading.
-                    selection.start += leading.start;
-                    selection.end = selection.start + leading.len();
-                }
-                SortMode::Month => {
-                    let initial_selection = &self.line[selection.clone()];
-                    let first_non_blank = initial_selection
-                        .iter()
-                        .position(|c| !c.is_ascii_whitespace())
-                        .unwrap_or(initial_selection.len());
-
-                    let (parsed, match_len) = month_parse(initial_selection);
-
-                    if parsed == Month::Unknown {
-                        // We failed to parse a month, which is equivalent to matching nothing.
-                        // Add the "no match for key" marker to the first non-whitespace character.
-                        selection.start += first_non_blank;
-                        selection.end = selection.start;
-                    } else {
-                        // We parsed a month. Use the actual match byte length.
-                        selection.start += first_non_blank;
-                        selection.end = selection.start + match_len;
-                    }
-                }
-                _ => {}
-            }
+            let selection = get_debug_selection(self.line, selector, &fields, settings);
 
             // Don't let embedded NUL bytes influence column alignment in the
             // debug underline output, since they are often filtered out (e.g.
@@ -824,19 +764,7 @@ impl<'a> Line<'a> {
             }
         }
 
-        if settings.mode != SortMode::Random
-            && !settings.stable
-            && !settings.unique
-            && (settings.dictionary_order
-                || settings.ignore_leading_blanks
-                || settings.ignore_case
-                || settings.ignore_non_printing
-                || settings.mode != SortMode::Default
-                || settings
-                    .selectors
-                    .last()
-                    .is_none_or(|selector| selector != &FieldSelector::default()))
-        {
+        if is_fallback_in_use(settings) {
             // A last resort comparator is in use, underline the whole line.
             if self.line.is_empty() {
                 writeln!(writer, "{}", translate!("sort-error-no-match-for-key"))?;
@@ -846,6 +774,200 @@ impl<'a> Line<'a> {
         }
         Ok(())
     }
+
+    fn write_debug_colored(
+        &self,
+        settings: &GlobalSettings,
+        writer: &mut impl Write,
+    ) -> std::io::Result<()> {
+        let line = self
+            .line
+            .iter()
+            .copied()
+            .map(|c| if c == b'\t' { b'>' } else { c })
+            .collect::<Vec<_>>();
+
+        if line.is_empty() {
+            writeln!(writer)?;
+            return Ok(());
+        }
+
+        let mut fields = vec![];
+        tokenize(
+            self.line,
+            settings.separator,
+            &mut fields,
+            &settings.precomputed,
+        );
+
+        let mut bg_colors = vec![None; line.len()];
+        for (idx, selector) in settings.selectors.iter().enumerate() {
+            let bg = BACKGROUND_CYCLE[idx % BACKGROUND_CYCLE.len()];
+            let selection = get_debug_selection(self.line, selector, &fields, settings);
+            let start = selection.start.min(line.len());
+            let end = selection.end.min(line.len());
+            if start < end {
+                for bg_slot in &mut bg_colors[start..end] {
+                    *bg_slot = Some(bg);
+                }
+            }
+        }
+
+        let fallback_in_use = is_fallback_in_use(settings);
+        let target_fg: Option<u8> = if fallback_in_use { None } else { Some(90) };
+
+        let mut current_bg: Option<u8> = None;
+        let mut current_fg: Option<u8> = None;
+
+        for (i, &byte) in line.iter().enumerate() {
+            let desired_bg = bg_colors[i];
+            let desired_fg = target_fg;
+
+            if desired_fg != current_fg || desired_bg != current_bg {
+                match (desired_fg, desired_bg) {
+                    (None, None) => {
+                        write!(writer, "\x1b[0m")?;
+                    }
+                    (Some(fg), None) => {
+                        if current_bg.is_some() {
+                            write!(writer, "\x1b[49m")?;
+                        }
+                        if current_fg != Some(fg) {
+                            write!(writer, "\x1b[{fg}m")?;
+                        }
+                    }
+                    (None, Some(bg)) => {
+                        if current_fg.is_some() {
+                            write!(writer, "\x1b[39m")?;
+                        }
+                        if current_bg != Some(bg) {
+                            write!(writer, "\x1b[{bg}m")?;
+                        }
+                    }
+                    (Some(fg), Some(bg)) => {
+                        if current_fg == Some(fg) && current_bg != Some(bg) {
+                            write!(writer, "\x1b[{bg}m")?;
+                        } else if current_fg != Some(fg) && current_bg == Some(bg) {
+                            write!(writer, "\x1b[{fg}m")?;
+                        } else {
+                            write!(writer, "\x1b[{fg};{bg}m")?;
+                        }
+                    }
+                }
+                current_fg = desired_fg;
+                current_bg = desired_bg;
+            }
+
+            writer.write_all(&[byte])?;
+        }
+
+        if current_fg.is_some() || current_bg.is_some() {
+            write!(writer, "\x1b[0m")?;
+        }
+        writeln!(writer)?;
+        Ok(())
+    }
+}
+
+const BACKGROUND_CYCLE: [u8; 8] = [42, 44, 45, 46, 41, 104, 105, 101];
+
+fn is_fallback_in_use(settings: &GlobalSettings) -> bool {
+    settings.mode != SortMode::Random
+        && !settings.stable
+        && !settings.unique
+        && (settings.dictionary_order
+            || settings.ignore_leading_blanks
+            || settings.ignore_case
+            || settings.ignore_non_printing
+            || settings.mode != SortMode::Default
+            || settings
+                .selectors
+                .last()
+                .is_none_or(|selector| selector != &FieldSelector::default()))
+}
+
+fn get_debug_selection(
+    line: &[u8],
+    selector: &FieldSelector,
+    fields: &[Range<usize>],
+    settings: &GlobalSettings,
+) -> Range<usize> {
+    let mut selection = selector.get_range(line, Some(fields));
+    match selector.settings.mode {
+        SortMode::Numeric | SortMode::HumanNumeric => {
+            // find out which range is used for numeric comparisons
+            let mut parse_settings = settings
+                .numeric_locale
+                .num_info_settings(selector.settings.mode == SortMode::HumanNumeric);
+            // Debug annotations should ignore thousands separators to match GNU output.
+            parse_settings.thousands_separator = None;
+            let (_, num_range) = NumInfo::parse(&line[selection.clone()], &parse_settings);
+            let initial_selection = selection.clone();
+
+            // Shorten selection to num_range.
+            selection.start += num_range.start;
+            selection.end = selection.start + num_range.len();
+
+            if num_range == (0..0) {
+                // This was not a valid number.
+                // Report no match at the first non-whitespace character.
+                let leading_whitespace = line[selection.clone()]
+                    .iter()
+                    .position(|c| !c.is_ascii_whitespace())
+                    .unwrap_or(0);
+                selection.start += leading_whitespace;
+                selection.end += leading_whitespace;
+            } else {
+                // include a trailing si unit
+                if selector.settings.mode == SortMode::HumanNumeric
+                    && line[selection.end..initial_selection.end]
+                        .first()
+                        .is_some_and(|c| b"kKMGTPEZYRQ".contains(c))
+                {
+                    selection.end += 1;
+                }
+
+                // include leading zeroes, a leading minus or a leading decimal point
+                while line[initial_selection.start..selection.start]
+                    .last()
+                    .is_some_and(|c| b"-0.".contains(c))
+                {
+                    selection.start -= 1;
+                }
+            }
+        }
+        SortMode::GeneralNumeric => {
+            let initial_selection = &line[selection.clone()];
+            let decimal_pt = locale_decimal_pt();
+            let leading = get_leading_gen(initial_selection, decimal_pt);
+
+            // Shorten selection to leading.
+            selection.start += leading.start;
+            selection.end = selection.start + leading.len();
+        }
+        SortMode::Month => {
+            let initial_selection = &line[selection.clone()];
+            let first_non_blank = initial_selection
+                .iter()
+                .position(|c| !c.is_ascii_whitespace())
+                .unwrap_or(initial_selection.len());
+
+            let (parsed, match_len) = month_parse(initial_selection);
+
+            if parsed == Month::Unknown {
+                // We failed to parse a month, which is equivalent to matching nothing.
+                // Add the "no match for key" marker to the first non-whitespace character.
+                selection.start += first_non_blank;
+                selection.end = selection.start;
+            } else {
+                // We parsed a month. Use the actual match byte length.
+                selection.start += first_non_blank;
+                selection.end = selection.start + match_len;
+            }
+        }
+        _ => {}
+    }
+    selection
 }
 
 /// Tokenize a line into fields. The result is stored into `token_buffer`.
@@ -1988,6 +2110,20 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     }
 
     settings.debug = matches.get_flag(options::DEBUG);
+    settings.color = match matches.get_one::<String>(options::COLOR) {
+        None => {
+            if matches.contains_id(options::COLOR) {
+                true
+            } else {
+                stdout().is_terminal()
+            }
+        }
+        Some(val) => match val.as_str() {
+            "always" | "yes" | "force" => true,
+            "auto" | "tty" | "if-tty" => stdout().is_terminal(),
+            /* "never" | "no" | "none" | */ _ => false,
+        },
+    };
     if let Some(path) = matches.get_one::<OsString>(options::RANDOM_SOURCE) {
         settings.random_source = Some(PathBuf::from(path));
     }
@@ -2538,6 +2674,18 @@ pub fn uu_app() -> Command {
             .long(options::DEBUG)
             .help(translate!("sort-help-debug"))
             .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::new(options::COLOR)
+            .long(options::COLOR)
+            .help(translate!("sort-help-color"))
+            .value_parser(ShortcutValueParser::new([
+                PossibleValue::new("always").alias("yes").alias("force"),
+                PossibleValue::new("auto").alias("tty").alias("if-tty"),
+                PossibleValue::new("never").alias("no").alias("none"),
+            ]))
+            .require_equals(true)
+            .num_args(0..=1),
     )
     .arg(
         Arg::new(options::FILES)
