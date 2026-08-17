@@ -320,8 +320,20 @@ impl Parser {
     }
 
     fn parse_bytes(arg: &str, val: &str) -> Result<usize, ParseError> {
-        parse_bytes_with_opt_multiplier(val)?
-            .try_into()
+        let num = parse_bytes_with_opt_multiplier(val)?;
+
+        if num == 0 {
+            return Err(ParseError::InvalidNumber(val.to_string()));
+        }
+        // GNU rejects a block size >= i64::MAX (intmax_t); otherwise the value
+        // overflows later when the buffer is computed or allocated.
+        if num >= i64::MAX as u64 {
+            return Err(ParseError::InvalidNumberWithErrMsg(
+                val.to_string(),
+                "Value too large for defined data type".to_string(),
+            ));
+        }
+        num.try_into()
             .map_err(|_| ParseError::BsOutOfRange(arg.to_string()))
     }
 
@@ -340,7 +352,6 @@ impl Parser {
         for f in val.split(',') {
             match f {
                 // Common flags
-                "cio" => return Err(ParseError::Unimplemented(f.to_string())),
                 "direct" => linux_only!(f, i.direct = true),
                 "directory" => linux_only!(f, i.directory = true),
                 "dsync" => linux_only!(f, i.dsync = true),
@@ -350,9 +361,9 @@ impl Parser {
                 "noatime" => linux_only!(f, i.noatime = true),
                 "noctty" => linux_only!(f, i.noctty = true),
                 "nofollow" => linux_only!(f, i.nofollow = true),
-                "nolinks" => return Err(ParseError::Unimplemented(f.to_string())),
-                "binary" => return Err(ParseError::Unimplemented(f.to_string())),
-                "text" => return Err(ParseError::Unimplemented(f.to_string())),
+                "cio" | "nolinks" | "binary" | "text" => {
+                    return Err(ParseError::Unimplemented(f.to_string()));
+                }
 
                 // Input-only flags
                 "fullblock" => i.fullblock = true,
@@ -372,7 +383,6 @@ impl Parser {
         for f in val.split(',') {
             match f {
                 // Common flags
-                "cio" => return Err(ParseError::Unimplemented(val.to_string())),
                 "direct" => linux_only!(f, o.direct = true),
                 "directory" => linux_only!(f, o.directory = true),
                 "dsync" => linux_only!(f, o.dsync = true),
@@ -382,9 +392,9 @@ impl Parser {
                 "noatime" => linux_only!(f, o.noatime = true),
                 "noctty" => linux_only!(f, o.noctty = true),
                 "nofollow" => linux_only!(f, o.nofollow = true),
-                "nolinks" => return Err(ParseError::Unimplemented(f.to_string())),
-                "binary" => return Err(ParseError::Unimplemented(f.to_string())),
-                "text" => return Err(ParseError::Unimplemented(f.to_string())),
+                "cio" | "nolinks" | "binary" | "text" => {
+                    return Err(ParseError::Unimplemented(f.to_string()));
+                }
 
                 // Output-only flags
                 "append" => o.append = true,
@@ -524,8 +534,8 @@ pub fn parse_bytes_with_opt_multiplier(s: &str) -> Result<u64, ParseError> {
         parse_bytes_no_x(s, parts[0])
     } else {
         let mut total: u64 = 1;
-        for part in parts {
-            if part == "0" {
+        for (i, part) in parts.iter().enumerate() {
+            if *part == "0" && i != parts.len() - 1 {
                 show_zero_multiplier_warning();
             }
             let num = parse_bytes_no_x(s, part)?;
@@ -552,8 +562,8 @@ fn get_ctable(
             Conversion::Ibm => &ASCII_TO_IBM,
         },
         (None, Some(case)) => match case {
-            Case::Lower => &ASCII_UCASE_TO_LCASE,
-            Case::Upper => &ASCII_LCASE_TO_UCASE,
+            Case::Lower => get_ucase_to_lcase_table(),
+            Case::Upper => get_lcase_to_ucase_table(),
         },
         (Some(conv), Some(case)) => match (conv, case) {
             (Conversion::Ascii, Case::Upper) => &EBCDIC_TO_ASCII_LCASE_TO_UCASE,

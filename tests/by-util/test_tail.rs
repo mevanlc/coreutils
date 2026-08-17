@@ -13,23 +13,16 @@
     clippy::cast_possible_truncation
 )]
 
-#[cfg(all(
-    not(target_vendor = "apple"),
-    not(target_os = "windows"),
-    not(target_os = "android"),
-    not(target_os = "freebsd")
-))]
-use nix::sys::signal::{Signal, kill};
-#[cfg(all(
-    not(target_vendor = "apple"),
-    not(target_os = "windows"),
-    not(target_os = "android"),
-    not(target_os = "freebsd")
-))]
-use nix::unistd::Pid;
 use pretty_assertions::assert_eq;
 use rand::distr::Alphanumeric;
 use rstest::rstest;
+#[cfg(all(
+    not(target_vendor = "apple"),
+    not(target_os = "windows"),
+    not(target_os = "android"),
+    not(target_os = "freebsd")
+))]
+use rustix::process::{Pid, Signal, kill_process};
 use std::char::from_digit;
 use std::fs::File;
 use std::io::Write;
@@ -211,6 +204,29 @@ fn test_nc_0_wo_follow() {
 }
 
 #[test]
+fn test_zero_bytes_with_suffix() {
+    // "0K" must be 0 bytes, not 1KiB (bare suffix parses as 1)
+    let ts = TestScenario::new(util_name!());
+    ts.ucmd()
+        .args(&["-c0K"])
+        .pipe_in("qwerty")
+        .ignore_stdin_write_error()
+        .succeeds()
+        .no_output();
+    ts.ucmd()
+        .args(&["-c00K"])
+        .pipe_in("qwerty")
+        .ignore_stdin_write_error()
+        .succeeds()
+        .no_output();
+    ts.ucmd()
+        .args(&["-c+0K"])
+        .pipe_in("qwerty")
+        .succeeds()
+        .stdout_is("qwerty");
+}
+
+#[test]
 #[cfg(all(unix, not(target_os = "freebsd")))]
 fn test_nc_0_wo_follow2() {
     use std::os::unix::fs::PermissionsExt;
@@ -234,7 +250,6 @@ fn test_nc_0_wo_follow2() {
 }
 
 #[test]
-#[cfg(not(target_os = "windows"))]
 fn test_n0_with_follow() {
     let (at, mut ucmd) = at_and_ucmd!();
     let test_file = "test.txt";
@@ -440,11 +455,7 @@ fn test_follow_stdin_descriptor() {
             .args(&args)
             .run_no_wait();
         p.make_assertion_with_delay(500).is_alive();
-        p.kill()
-            .make_assertion()
-            .with_all_output()
-            .no_stderr()
-            .no_stdout();
+        p.kill().make_assertion().with_all_output().no_output();
 
         args.pop();
     }
@@ -512,7 +523,6 @@ fn test_null_default() {
 }
 
 #[test]
-#[cfg(not(target_os = "windows"))] // FIXME: test times out
 fn test_follow_single() {
     let (at, mut ucmd) = at_and_ucmd!();
 
@@ -575,7 +585,31 @@ fn test_follow_non_utf8_bytes() {
 }
 
 #[test]
-#[cfg(not(target_os = "windows"))] // FIXME: test times out
+#[cfg(unix)]
+fn test_permission_denied_is_not_reported_as_not_found() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+
+    let (at, mut ucmd) = at_and_ucmd!();
+
+    at.mkdir("noexec");
+    at.touch("noexec/file");
+
+    let dir = at.plus("noexec");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+
+    ucmd.arg("noexec/file")
+        .fails()
+        .stderr_contains("Permission denied");
+
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
 fn test_follow_multiple() {
     let (at, mut ucmd) = at_and_ucmd!();
     let mut child = ucmd
@@ -611,7 +645,6 @@ fn test_follow_multiple() {
 }
 
 #[test]
-#[cfg(not(target_os = "windows"))] // FIXME: test times out
 fn test_follow_name_multiple() {
     // spell-checker:disable-next-line
     for argument in ["--follow=name", "--follo=nam", "--f=n"] {
@@ -622,17 +655,24 @@ fn test_follow_name_multiple() {
             .arg(FOOBAR_2_TXT)
             .run_no_wait();
 
+        #[cfg(target_os = "linux")]
+        let delay = 100;
+        #[cfg(target_os = "macos")]
+        let delay = 2000;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let delay = 1000;
+
         child
-            .make_assertion_with_delay(500)
+            .make_assertion_with_delay(delay)
             .is_alive()
-            .with_current_output()
+            .with_all_output()
             .stdout_only_fixture("foobar_follow_multiple.expected");
 
         let first_append = "trois\n";
         at.append(FOOBAR_2_TXT, first_append);
 
         child
-            .make_assertion_with_delay(DEFAULT_SLEEP_INTERVAL_MILLIS)
+            .make_assertion_with_delay(delay)
             .with_current_output()
             .stdout_only(first_append);
 
@@ -640,7 +680,7 @@ fn test_follow_name_multiple() {
         at.append(FOOBAR_TXT, second_append);
 
         child
-            .make_assertion_with_delay(DEFAULT_SLEEP_INTERVAL_MILLIS)
+            .make_assertion_with_delay(delay)
             .with_current_output()
             .stdout_only_fixture("foobar_follow_multiple_appended.expected");
 
@@ -762,7 +802,11 @@ fn test_follow_with_pid() {
         .stdout_only_fixture("foobar_follow_multiple_appended.expected");
 
     // kill the dummy process and give tail time to notice this
-    kill(Pid::from_raw(i32::try_from(pid).unwrap()), Signal::SIGUSR1).unwrap();
+    kill_process(
+        Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
+        Signal::USR1,
+    )
+    .unwrap();
     let _ = dummy.wait();
 
     child.delay(DEFAULT_SLEEP_INTERVAL_MILLIS);
@@ -774,8 +818,7 @@ fn test_follow_with_pid() {
         .make_assertion_with_delay(DEFAULT_SLEEP_INTERVAL_MILLIS)
         .is_not_alive()
         .with_current_output()
-        .no_stderr()
-        .no_stdout()
+        .no_output()
         .success();
 }
 
@@ -1072,8 +1115,7 @@ fn test_positive_zero_bytes() {
         .pipe_in("abcde")
         .ignore_stdin_write_error()
         .succeeds()
-        .no_stdout()
-        .no_stderr();
+        .no_output();
 }
 
 /// Test for reading all but the first NUM lines: `tail -n +3`.
@@ -1153,8 +1195,7 @@ fn test_obsolete_syntax_zero_lines_file() {
     new_ucmd!()
         .args(&["-0", "foobar.txt"])
         .succeeds()
-        .no_stderr()
-        .no_stdout();
+        .no_output();
 }
 
 /// Test for reading all lines, specified by `tail -n +0`.
@@ -1171,8 +1212,7 @@ fn test_positive_zero_lines() {
         .pipe_in("a\nb\nc\nd\ne\n")
         .ignore_stdin_write_error()
         .succeeds()
-        .no_stderr()
-        .no_stdout();
+        .no_output();
 }
 
 #[test]
@@ -1396,7 +1436,7 @@ fn test_retry4() {
         missing,
         "---disable-inotify",
     ];
-    let mut delay = 1500;
+    let mut delay = 150;
     for _ in 0..2 {
         let mut p = ts.ucmd().args(&args).run_no_wait();
 
@@ -1546,7 +1586,7 @@ fn test_retry7() {
         "--use-polling",
     ];
 
-    let mut delay = 1500;
+    let mut delay = 500;
     for _ in 0..2 {
         at.mkdir(untailable);
 
@@ -1587,6 +1627,62 @@ fn test_retry7() {
         at.remove(untailable);
         delay /= 3;
     }
+}
+
+/// Under `--follow=name`, a watched file replaced by a symlink must be reported
+/// as untailable, not silently followed to the link target (which would
+/// exfiltrate its contents).
+#[test]
+#[cfg(unix)]
+#[cfg(not(target_os = "android"))]
+fn test_follow_name_replaced_by_symlink_is_untailable() {
+    let ts = TestScenario::new(util_name!());
+    let at = &ts.fixtures;
+
+    at.write("secret", "secret-must-not-leak\n");
+    at.write("watched", "visible\n");
+
+    let mut p = ts
+        .ucmd()
+        .args(&[
+            "-F",
+            "-s.1",
+            "--max-unchanged-stats=1",
+            "--use-polling",
+            "watched",
+        ])
+        .run_no_wait();
+    p.make_assertion_with_delay(500).is_alive();
+
+    // Wait until tail's *initial* read of "watched" has actually completed
+    // (i.e. the pre-existing content has been printed) before swapping it
+    // for a symlink. Otherwise, under scheduler contention, tail's initial
+    // open (which legitimately follows symlinks, like any other file open)
+    // could race with the swap and open the symlink's target on its very
+    // first read -- before the untailable-symlink guard (which only applies
+    // to the follow loop) is even active. That would be a test timing bug,
+    // not the vulnerability this test is meant to catch.
+    for _ in 0..50 {
+        if p.stdout_all().contains("visible") {
+            break;
+        }
+        p.delay(20);
+    }
+
+    // Swap the watched file for a symlink pointing at a secret file.
+    // Create the symlink under a temporary name and rename it into place
+    // atomically, so the poller never observes an intermediate state where
+    // "watched" is missing (which would race with the poll interval and be
+    // reported as "has become inaccessible" instead).
+    at.symlink_file("secret", "watched.tmp");
+    at.rename("watched.tmp", "watched");
+    p.delay(1000);
+
+    p.kill()
+        .make_assertion()
+        .with_all_output()
+        .stdout_does_not_contain("secret-must-not-leak")
+        .stderr_contains("has been replaced with an untailable symbolic link");
 }
 
 #[test]
@@ -1694,14 +1790,14 @@ fn test_retry9() {
     );
     let expected_stdout = "foo\nbar\nfoo\nbar\n";
 
-    let delay = 1000;
+    let delay = 400;
 
     at.mkdir(parent_dir);
     at.truncate(user_path, "foo\n");
     let mut p = ts
         .ucmd()
         .arg("-F")
-        .arg("-s.1")
+        .arg("-s.2")
         .arg("--max-unchanged-stats=1")
         .arg(user_path)
         .run_no_wait();
@@ -1770,7 +1866,7 @@ fn test_follow_descriptor_vs_rename1() {
         "---disable-inotify",
     ];
 
-    let mut delay = 1500;
+    let mut delay = 100;
     for _ in 0..2 {
         at.touch(file_a);
 
@@ -1832,7 +1928,7 @@ fn test_follow_descriptor_vs_rename2() {
         "---disable-inotify",
     ];
 
-    let mut delay = 1500;
+    let mut delay = 150;
     for _ in 0..2 {
         at.touch(file_a);
         at.touch(file_b);
@@ -1897,7 +1993,7 @@ fn test_follow_name_retry_headers() {
         "---disable-inotify",
     ];
 
-    let mut delay = 1500;
+    let mut delay = 150;
     for _ in 0..2 {
         let mut p = ts.ucmd().args(&args).run_no_wait();
 
@@ -1990,11 +2086,7 @@ fn test_follow_name_remove() {
 }
 
 #[test]
-#[cfg(all(
-    not(target_os = "windows"),
-    not(target_os = "android"),
-    not(target_os = "freebsd")
-))] // FIXME: for currently not working platforms
+#[cfg(all(not(target_os = "android"), not(target_os = "freebsd")))] // FIXME: for currently not working platforms
 fn test_follow_name_truncate1() {
     // This test triggers a truncate event while `tail --follow=name file` is running.
     // $ cp file backup && head file > file && sleep 1 && cp backup file
@@ -2031,11 +2123,7 @@ fn test_follow_name_truncate1() {
 }
 
 #[test]
-#[cfg(all(
-    not(target_os = "windows"),
-    not(target_os = "android"),
-    not(target_os = "freebsd")
-))] // FIXME: for currently not working platforms
+#[cfg(all(not(target_os = "android"), not(target_os = "freebsd")))] // FIXME: for currently not working platforms
 fn test_follow_name_truncate2() {
     // This test triggers a truncate event while `tail --follow=name file` is running.
     // $ ((sleep 1 && echo -n "x\nx\nx\n" >> file && sleep 1 && \
@@ -2078,7 +2166,6 @@ fn test_follow_name_truncate2() {
 }
 
 #[test]
-#[cfg(not(target_os = "windows"))] // FIXME: for currently not working platforms
 fn test_follow_name_truncate3() {
     // Opening an empty file in truncate mode should not trigger a truncate event while
     // `tail --follow=name file` is running.
@@ -2287,7 +2374,7 @@ fn test_follow_name_move_create2() {
         "9",
     ];
 
-    let mut delay = 500;
+    let mut delay = 100;
     for i in 0..2 {
         let mut p = ts.ucmd().args(&args).run_no_wait();
 
@@ -2600,7 +2687,7 @@ fn test_follow_name_move_retry2() {
 
     let mut args = vec!["-s.1", "--max-unchanged-stats=1", "-F", file1, file2];
 
-    let mut delay = 500;
+    let mut delay = 60;
     for i in 0..2 {
         at.touch(file1);
         at.touch(file2);
@@ -2660,11 +2747,7 @@ fn test_follow_inotify_only_regular() {
     let mut p = ts.ucmd().arg("-f").arg("/dev/null").run_no_wait();
 
     p.make_assertion_with_delay(200).is_alive();
-    p.kill()
-        .make_assertion()
-        .with_all_output()
-        .no_stderr()
-        .no_stdout();
+    p.kill().make_assertion().with_all_output().no_output();
 }
 
 #[test]
@@ -2714,20 +2797,12 @@ fn test_fifo() {
 
     let mut p = ts.ucmd().arg("FIFO").run_no_wait();
     p.make_assertion_with_delay(500).is_alive();
-    p.kill()
-        .make_assertion()
-        .with_all_output()
-        .no_stderr()
-        .no_stdout();
+    p.kill().make_assertion().with_all_output().no_output();
 
     for arg in ["-f", "-F"] {
         let mut p = ts.ucmd().arg(arg).arg("FIFO").run_no_wait();
         p.make_assertion_with_delay(500).is_alive();
-        p.kill()
-            .make_assertion()
-            .with_all_output()
-            .no_stderr()
-            .no_stdout();
+        p.kill().make_assertion().with_all_output().no_output();
     }
 }
 
@@ -2758,15 +2833,18 @@ fn test_fifo_with_pid() {
 
     child.make_assertion_with_delay(500).is_alive();
 
-    kill(Pid::from_raw(i32::try_from(pid).unwrap()), Signal::SIGUSR1).unwrap();
+    kill_process(
+        Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
+        Signal::USR1,
+    )
+    .unwrap();
     let _ = dummy.wait();
 
     child
         .make_assertion_with_delay(DEFAULT_SLEEP_INTERVAL_MILLIS)
         .is_not_alive()
         .with_all_output()
-        .no_stderr()
-        .no_stdout()
+        .no_output()
         .success();
 }
 
@@ -2829,24 +2907,21 @@ fn test_pipe_when_lines_option_value_is_higher_than_contained_lines() {
         .pipe_in(test_string)
         .ignore_stdin_write_error()
         .succeeds()
-        .no_stdout()
-        .no_stderr();
+        .no_output();
 
     new_ucmd!()
         .args(&["-n", "+4"])
         .pipe_in(test_string)
         .ignore_stdin_write_error()
         .succeeds()
-        .no_stdout()
-        .no_stderr();
+        .no_output();
 
     new_ucmd!()
         .args(&["-n", "+999"])
         .pipe_in(test_string)
         .ignore_stdin_write_error()
         .succeeds()
-        .no_stdout()
-        .no_stderr();
+        .no_output();
 }
 
 #[test]
@@ -2858,8 +2933,7 @@ fn test_pipe_when_negative_lines_option_given_no_newline_at_eof() {
         .pipe_in(test_string)
         .ignore_stdin_write_error()
         .succeeds()
-        .no_stdout()
-        .no_stderr();
+        .no_output();
 
     new_ucmd!()
         .args(&["-n", "1"])
@@ -2940,8 +3014,7 @@ fn test_pipe_when_lines_option_given_multibyte_utf8_characters() {
         .pipe_in(test_string)
         .ignore_stdin_write_error()
         .succeeds()
-        .no_stdout()
-        .no_stderr();
+        .no_output();
 
     new_ucmd!()
         .args(&["-n", "-4"])
@@ -2976,8 +3049,7 @@ fn test_pipe_when_lines_option_given_multibyte_utf8_characters() {
         .pipe_in(test_string)
         .ignore_stdin_write_error()
         .succeeds()
-        .no_stdout()
-        .no_stderr();
+        .no_output();
 }
 
 #[test]
@@ -3043,8 +3115,7 @@ fn test_pipe_when_lines_option_given_input_size_is_equal_to_buffer_size() {
         .pipe_in(random_string)
         .ignore_stdin_write_error()
         .succeeds()
-        .no_stdout()
-        .no_stderr();
+        .no_output();
 
     let expected = lines.clone().skip(total_lines - 1).collect::<String>();
     new_ucmd!()
@@ -3151,8 +3222,7 @@ fn test_pipe_when_lines_option_given_input_size_has_multiple_size_of_buffer_size
         .pipe_in(random_string)
         .ignore_stdin_write_error()
         .succeeds()
-        .no_stdout()
-        .no_stderr();
+        .no_output();
 
     let expected = lines.clone().skip(total_lines - 1).collect::<String>();
     new_ucmd!()
@@ -3207,24 +3277,21 @@ fn test_pipe_when_bytes_option_value_is_higher_than_contained_bytes() {
         .pipe_in(test_string)
         .ignore_stdin_write_error()
         .succeeds()
-        .no_stdout()
-        .no_stderr();
+        .no_output();
 
     new_ucmd!()
         .args(&["-c", "+5"])
         .pipe_in(test_string)
         .ignore_stdin_write_error()
         .succeeds()
-        .no_stdout()
-        .no_stderr();
+        .no_output();
 
     new_ucmd!()
         .args(&["-c", "+999"])
         .pipe_in(test_string)
         .ignore_stdin_write_error()
         .succeeds()
-        .no_stdout()
-        .no_stderr();
+        .no_output();
 }
 
 #[test]
@@ -3272,8 +3339,7 @@ fn test_pipe_when_bytes_option_given_multibyte_utf8_characters() {
         .pipe_in(test_string)
         .ignore_stdin_write_error()
         .succeeds()
-        .no_stdout()
-        .no_stderr();
+        .no_output();
 
     new_ucmd!()
         .args(&["-c", "-1"])
@@ -3336,8 +3402,7 @@ fn test_pipe_when_bytes_option_given_input_size_is_equal_to_buffer_size() {
         .pipe_in(random_string)
         .ignore_stdin_write_error()
         .succeeds()
-        .no_stdout()
-        .no_stderr();
+        .no_output();
 
     let expected = &random_string.as_bytes()[1..];
     new_ucmd!()
@@ -3395,8 +3460,7 @@ fn test_pipe_when_bytes_option_given_input_size_is_one_byte_greater_than_buffer_
         .pipe_in(random_string)
         .ignore_stdin_write_error()
         .succeeds()
-        .no_stdout()
-        .no_stderr();
+        .no_output();
 
     let expected = &random_string.as_bytes()[CHUNK_BUFFER_SIZE..];
     new_ucmd!()
@@ -3442,8 +3506,7 @@ fn test_pipe_when_bytes_option_given_input_size_has_multiple_size_of_buffer_size
         .pipe_in(random_string)
         .ignore_stdin_write_error()
         .succeeds()
-        .no_stdout()
-        .no_stderr();
+        .no_output();
 
     let expected = &random_string.as_bytes()[8192..];
     new_ucmd!()
@@ -3551,8 +3614,7 @@ fn test_args_when_presume_input_pipe_given_input_is_pipe() {
         .pipe_in(random_string)
         .ignore_stdin_write_error()
         .succeeds()
-        .no_stdout()
-        .no_stderr();
+        .no_output();
 
     new_ucmd!()
         .args(&["---presume-input-pipe", "-c", "+0"])
@@ -3566,8 +3628,7 @@ fn test_args_when_presume_input_pipe_given_input_is_pipe() {
         .pipe_in(random_string)
         .ignore_stdin_write_error()
         .succeeds()
-        .no_stdout()
-        .no_stderr();
+        .no_output();
 
     new_ucmd!()
         .args(&["---presume-input-pipe", "-n", "+0"])
@@ -3589,8 +3650,7 @@ fn test_args_when_presume_input_pipe_given_input_is_file() {
     ts.ucmd()
         .args(&["---presume-input-pipe", "-c", "-0", "data"])
         .succeeds()
-        .no_stdout()
-        .no_stderr();
+        .no_output();
 
     ts.ucmd()
         .args(&["---presume-input-pipe", "-c", "+0", "data"])
@@ -3600,8 +3660,7 @@ fn test_args_when_presume_input_pipe_given_input_is_file() {
     ts.ucmd()
         .args(&["---presume-input-pipe", "-n", "-0", "data"])
         .succeeds()
-        .no_stdout()
-        .no_stderr();
+        .no_output();
 
     ts.ucmd()
         .args(&["---presume-input-pipe", "-n", "+0", "data"])
@@ -3652,11 +3711,7 @@ fn test_when_argument_file_is_a_symlink() {
 
     at.symlink_file("target", "link");
 
-    ts.ucmd()
-        .args(&["-c", "+0", "link"])
-        .succeeds()
-        .no_stdout()
-        .no_stderr();
+    ts.ucmd().args(&["-c", "+0", "link"]).succeeds().no_output();
 
     let random_string = RandomizedString::generate(AlphanumericNewline, 100);
     let result = file.write_all(random_string.as_bytes());
@@ -3746,10 +3801,10 @@ fn test_when_argument_file_is_non_existent_unix_socket_address_then_error() {
         format!("tail: cannot open '{socket}' for reading: No such device or address\n");
     #[cfg(target_os = "freebsd")]
     let expected_stderr =
-        format!("tail: cannot open '{socket}' for reading: Operation not supported\n",);
+        format!("tail: cannot open '{socket}' for reading: Operation not supported\n");
     #[cfg(target_os = "macos")]
     let expected_stderr =
-        format!("tail: cannot open '{socket}' for reading: Operation not supported on socket\n",);
+        format!("tail: cannot open '{socket}' for reading: Operation not supported on socket\n");
 
     ts.ucmd()
         .arg(socket)
@@ -4044,7 +4099,7 @@ fn test_args_when_settings_check_warnings_then_shows_warnings() {
     );
     scene
         .ucmd()
-        .args(&["--pid=1000", "data"])
+        .args(&["--pid=0", "data"])
         .stderr_to_stdout()
         .succeeds()
         .stdout_only(expected_stdout);
@@ -4883,11 +4938,7 @@ fn test_gnu_args_f() {
     at.touch(source);
     let mut p = scene.ucmd().args(&["+f", source]).run_no_wait();
     p.make_assertion_with_delay(500).is_alive();
-    p.kill()
-        .make_assertion()
-        .with_all_output()
-        .no_stderr()
-        .no_stdout();
+    p.kill().make_assertion().with_all_output().no_output();
 
     let mut p = scene
         .ucmd()
@@ -4895,11 +4946,7 @@ fn test_gnu_args_f() {
         .arg("+f")
         .run_no_wait();
     p.make_assertion_with_delay(500).is_alive();
-    p.kill()
-        .make_assertion()
-        .with_all_output()
-        .no_stderr()
-        .no_stdout();
+    p.kill().make_assertion().with_all_output().no_output();
 }
 
 #[test]
@@ -5008,17 +5055,16 @@ fn test_when_piped_input_then_no_broken_pipe() {
             .args(&["-n", "0"])
             .pipe_in(test_string)
             .succeeds()
-            .no_stdout()
-            .no_stderr();
+            .no_output();
     }
 }
 
 #[test]
 #[cfg(unix)]
-fn test_when_output_closed_then_no_broken_pie() {
+fn test_when_output_closed_then_no_broken_pipe() {
     let mut cmd = new_ucmd!();
     let mut child = cmd
-        .args(&["-c", "100000", "/dev/zero"])
+        .args(&["-c", "10000000", "/dev/zero"])
         .set_stdout(Stdio::piped())
         .run_no_wait();
     // Dropping the stdout should not lead to an error.
@@ -5054,8 +5100,32 @@ fn test_failed_write_is_reported() {
         .stderr_is("tail: No space left on device\n");
 }
 
-#[test]
 #[cfg(target_os = "linux")]
+#[test]
+fn test_failed_warning_write_is_reported() {
+    new_ucmd!()
+        .args(&["--pid=0", "/dev/null"])
+        .set_stderr(File::create("/dev/full").unwrap())
+        .fails_with_code(1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_failed_write_is_reported_on_seekable_input() {
+    let ts = TestScenario::new("tail");
+    let at = &ts.fixtures;
+
+    at.write("bigfile", &"x\n".repeat(1_100_000));
+
+    ts.ucmd()
+        .arg("bigfile")
+        .set_stdout(File::create("/dev/full").unwrap())
+        .fails()
+        .stderr_is("tail: No space left on device\n");
+}
+
+#[test]
+#[cfg(unix)]
 fn test_dev_zero() {
     new_ucmd!()
         .args(&["-c", "1", "/dev/zero"])
@@ -5184,4 +5254,40 @@ fn test_follow_symlink_target_change() {
         .with_all_output()
         .stdout_contains("A\n")
         .stdout_contains("B\n");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_no_skip_after_error() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.write("f", "hello");
+    ucmd.args(&["/proc/self/mem", "f"])
+        .fails()
+        .stdout_contains("hello");
+}
+
+#[cfg(unix)]
+#[cfg(all(feature = "feat_diagnostics", not(wasi_runner)))]
+mod diagnostics {
+    use super::*;
+
+    #[test]
+    fn test_snippet_points_at_the_unknown_unit() {
+        let result = new_ucmd!()
+            .terminal_sim_stderr()
+            .args(&["-c", "1fb", "/dev/null"])
+            .fails_with_code(1);
+        let stderr = result.stderr_as_displayed();
+
+        assert!(stderr.contains("tail:1:10"), "{stderr}");
+        assert!(stderr.contains("not a known unit"), "{stderr}");
+    }
+
+    #[test]
+    fn test_plain_message_when_stderr_is_a_pipe() {
+        new_ucmd!()
+            .args(&["-n", "5QQ", "/dev/null"])
+            .fails_with_code(1)
+            .stderr_is("tail: invalid number of lines: '5QQ'\n");
+    }
 }

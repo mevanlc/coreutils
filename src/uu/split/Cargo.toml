@@ -3,7 +3,6 @@ name = "uu_split"
 description = "split ~ (uutils) split input into output files"
 repository = "https://github.com/uutils/coreutils/tree/main/src/uu/split"
 version.workspace = true
-authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 keywords.workspace = true
@@ -12,15 +11,14 @@ edition.workspace = true
 rust-version.workspace = true
 readme.workspace = true
 
-[lints]
-workspace = true
-
 [lib]
 path = "src/split.rs"
+doctest = false
 
 [dependencies]
 clap = { workspace = true }
 memchr = { workspace = true }
+rustix = { workspace = true }
 uucore = { workspace = true, features = ["fs", "parser-size"] }
 thiserror = { workspace = true }
 fluent = { workspace = true }
@@ -33,6 +31,9 @@ path = "src/main.rs"
 divan = { workspace = true }
 tempfile = { workspace = true }
 uucore = { workspace = true, features = ["benchmark"] }
+
+[lints]
+workspace = true
 
 [[bench]]
 name = "split_bench"

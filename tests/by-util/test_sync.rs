@@ -32,6 +32,11 @@ fn test_sync_fs() {
 }
 
 #[test]
+fn test_sync_fs_without_files_falls_back_to_full_sync() {
+    new_ucmd!().arg("--file-system").succeeds();
+}
+
+#[test]
 fn test_sync_data() {
     // Todo add a second arg
     let temporary_directory = tempdir().unwrap();
@@ -172,8 +177,7 @@ fn test_sync_multiple_files() {
 fn test_sync_multiple_nonexistent_files() {
     let result = new_ucmd!().arg("--data").arg("bad1").arg("bad2").fails();
 
-    result.stderr_contains("sync: error opening 'bad1': No such file or directory");
-    result.stderr_contains("sync: error opening 'bad2': No such file or directory");
+    result.stderr_is("sync: error opening 'bad1': No such file or directory\nsync: error opening 'bad2': No such file or directory\n");
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

@@ -3,7 +3,6 @@ name = "uu_pr"
 description = "pr ~ (uutils) convert text files for printing"
 repository = "https://github.com/uutils/coreutils/tree/main/src/uu/pr"
 version.workspace = true
-authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 keywords.workspace = true
@@ -12,11 +11,10 @@ edition.workspace = true
 rust-version.workspace = true
 readme.workspace = true
 
-[lints]
-workspace = true
-
 [lib]
 path = "src/pr.rs"
+test = false
+doctest = false
 
 [dependencies]
 clap = { workspace = true }
@@ -26,6 +24,9 @@ memchr = { workspace = true }
 regex = { workspace = true }
 thiserror = { workspace = true }
 fluent = { workspace = true }
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "pr"

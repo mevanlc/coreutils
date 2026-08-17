@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # spell-checker:ignore (env/flags) Ccodegen Cinstrument Coverflow Cpanic Zpanic
-# spell-checker:ignore PROFDATA PROFRAW coreutil librairies nextest profdata profraw rustlib
+# spell-checker:ignore PROFDATA PROFRAW coreutil librairies nextest profdata profraw rustlib setfacl
 
 # This script will build, run and generate coverage reports for the whole
 # testsuite.
@@ -41,10 +41,10 @@ REPO_main_dir="$(dirname -- "${ME_dir}")"
 FEATURES_OPTION=${FEATURES_OPTION:-"--features=feat_os_unix"}
 COVERAGE_DIR=${COVERAGE_DIR:-"${REPO_main_dir}/coverage"}
 
-# Find llvm-profdata in the nightly toolchain (which is used for coverage builds)
-LLVM_PROFDATA="$(find "$(RUSTUP_TOOLCHAIN=nightly-gnu rustc --print sysroot)" -name llvm-profdata)"
+# Find llvm-profdata (which is used for coverage builds)
+LLVM_PROFDATA="$(find "$(rustc --print sysroot)" -name llvm-profdata)"
 if [ -z "${LLVM_PROFDATA}" ]; then
-    echo "Error: llvm-profdata not found. Install it with: rustup +nightly-gnu component add llvm-tools"
+    echo "Error: llvm-profdata not found. Install it with: rustup component add llvm-tools"
     exit 1
 fi
 
@@ -53,17 +53,47 @@ PROFDATA_DIR="${COVERAGE_DIR}/data"
 REPORT_DIR="${COVERAGE_DIR}/report"
 REPORT_PATH="${REPORT_DIR}/total.lcov.info"
 
-rm -rf "${PROFRAW_DIR}" && mkdir -p "${PROFRAW_DIR}"
+# Some tests set umask(0777) via uutests pre_exec. LLVM profile files created
+# under that umask can be mode 000; later writes fail with EACCES and the error
+# lands on utility stderr (breaks exact asserts, e.g. mkfifo).
+# Default ACL keeps new .profraw files owner-writable. Keep LLVM's bounded
+# online-merge pool (%4m) instead of one file per process (%p-%m).
+prepare_profraw_dir() {
+    rm -rf "${PROFRAW_DIR}"
+    mkdir -p "${PROFRAW_DIR}"
+    chmod 700 "${PROFRAW_DIR}"
+    if ! command -v setfacl >/dev/null 2>&1; then
+        if [ -n "${CI:-}" ]; then
+            echo "error: setfacl required for coverage profraw dir (install acl)" >&2
+            exit 1
+        fi
+        return 0
+    fi
+    if ! setfacl -d -m u::rw,g::---,o::---,m::rw "${PROFRAW_DIR}"; then
+        if [ -n "${CI:-}" ]; then
+            echo "error: setfacl default ACL failed on ${PROFRAW_DIR}" >&2
+            exit 1
+        fi
+    fi
+    if ! setfacl -m u::rwx,g::---,o::---,m::rwx "${PROFRAW_DIR}"; then
+        if [ -n "${CI:-}" ]; then
+            echo "error: setfacl access ACL failed on ${PROFRAW_DIR}" >&2
+            exit 1
+        fi
+    fi
+}
+
+prepare_profraw_dir
 rm -rf "${PROFDATA_DIR}" && mkdir -p "${PROFDATA_DIR}"
 rm -rf "${REPORT_DIR}" && mkdir -p "${REPORT_DIR}"
 
 #shellcheck disable=SC2086
 UTIL_LIST=$("${ME_dir}"/show-utils.sh ${FEATURES_OPTION})
 
+export RUSTC_BOOTSTRAP=1
 export CARGO_INCREMENTAL=0
 export RUSTFLAGS="-Cinstrument-coverage -Ccodegen-units=1 -Copt-level=0 -Clink-dead-code -Coverflow-checks=off -Zpanic_abort_tests -Cpanic=abort"
 export RUSTDOCFLAGS="-Cpanic=abort"
-export RUSTUP_TOOLCHAIN="nightly-gnu"
 export LLVM_PROFILE_FILE="${PROFRAW_DIR}/coverage-%4m.profraw"
 
 # Disable expanded command printing for the rest of the program
@@ -108,7 +138,7 @@ for UTIL in ${UTIL_LIST}; do
     fi
 
     echo "## Clear the trace directory to free up space"
-    rm -rf "${PROFRAW_DIR}" && mkdir -p "${PROFRAW_DIR}"
+    prepare_profraw_dir
 done;
 
 echo "Running coverage tests over uucore"

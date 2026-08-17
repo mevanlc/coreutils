@@ -5,7 +5,7 @@
 // spell-checker:ignore αbcdef ; (people) kkos
 // spell-checker:ignore aabcccd aabcd aabd abbb abbbd abbcabc abbcac abbcbbbd abbcbd
 // spell-checker:ignore abbccd abcabc abcac acabc andand bigcmp bignum emptysub
-// spell-checker:ignore orempty oror bcdef fedcb
+// spell-checker:ignore orempty oror bcdef fedcb GHSA xjfw pqfw
 
 use uutests::new_ucmd;
 
@@ -215,6 +215,29 @@ fn test_and() {
     new_ucmd!().args(&["", "&", "1"]).fails().stdout_only("0\n");
 
     new_ucmd!().args(&["", "&", ""]).fails().stdout_only("0\n");
+}
+
+#[test]
+fn test_parenthesized_short_circuit_dead_branches() {
+    new_ucmd!()
+        .args(&["1", "|", "(", "1", "/", "0", ")"])
+        .succeeds()
+        .stdout_only("1\n");
+
+    new_ucmd!()
+        .args(&["0", "&", "(", "1", "/", "0", ")"])
+        .fails_with_code(1)
+        .stdout_only("0\n");
+
+    new_ucmd!()
+        .args(&["1", "|", "(", "0", "&", "(", "1", "/", "0", ")", ")"])
+        .succeeds()
+        .stdout_only("1\n");
+
+    new_ucmd!()
+        .args(&["0", "&", "(", "1", "|", "(", "1", "/", "0", ")", ")"])
+        .fails_with_code(1)
+        .stdout_only("0\n");
 }
 
 #[test]
@@ -466,6 +489,15 @@ fn test_regex_newline() {
 }
 
 #[test]
+fn test_regex_catastrophic_backtracking() {
+    let input = "a".repeat(30) + "c";
+    new_ucmd!()
+        .args(&[input.as_str(), ":", "\\(a\\+a\\+\\)\\+b"])
+        .fails_with_code(1)
+        .stdout_only("\n");
+}
+
+#[test]
 fn test_substr() {
     new_ucmd!()
         .args(&["substr", "abc", "1", "1"])
@@ -580,11 +612,11 @@ fn test_num_str_comparison() {
 }
 
 #[test]
-fn test_eager_evaluation() {
+fn test_missing_closing_parenthesis_reports_syntax_error() {
     new_ucmd!()
         .args(&["(", "1", "/", "0"])
         .fails()
-        .stderr_contains("division by zero");
+        .stderr_contains("expecting ')' after '0'");
 }
 
 #[test]
@@ -615,6 +647,38 @@ fn test_long_input() {
     }
 
     new_ucmd!().args(&args).succeeds().stdout_is(RESULT);
+}
+
+#[test]
+fn test_deeply_nested_expression() {
+    // A deeply nested expression should succeed rather than abort due to a
+    // stack overflow in the parser (GHSA-gr9g-xjfw-pqfw).
+    #[cfg(not(windows))]
+    const DEPTH: usize = 10000;
+
+    // On windows there is 8192 characters input limit
+    #[cfg(windows)]
+    const DEPTH: usize = 2000; // 8003 characters (with spaces)
+
+    let mut args: Vec<&str> = vec!["("; DEPTH];
+    args.push("1");
+    args.extend(std::iter::repeat_n(")", DEPTH));
+    new_ucmd!().args(&args).succeeds().stdout_is("1\n");
+}
+
+#[test]
+fn test_deeply_nested_length() {
+    // Keyword operands recurse in the parser just like parentheses do.
+    #[cfg(not(windows))]
+    const DEPTH: usize = 10000;
+
+    // On windows there is 8192 characters input limit
+    #[cfg(windows)]
+    const DEPTH: usize = 1000; // 7002 characters (with spaces)
+
+    let mut args: Vec<&str> = vec!["length"; DEPTH];
+    args.push("1");
+    new_ucmd!().args(&args).succeeds().stdout_is("1\n");
 }
 
 /// Regroup the testcases of the GNU test expr.pl
@@ -1974,4 +2038,169 @@ fn test_emoji_operations() {
         .args(&["🌍", "!=", "🌎"])
         .succeeds()
         .stdout_only("1\n");
+}
+
+#[cfg(all(feature = "feat_diagnostics", not(wasi_runner)))]
+mod diagnostics {
+    use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn test_snippet_points_at_the_unexpected_argument() {
+        let result = new_ucmd!()
+            .terminal_sim_stderr()
+            .args(&["6", "+", "7", "spare"])
+            .fails_with_code(2);
+
+        // The whole report: the `expr: ` prefix of the plain form, the
+        // expression echoed back, a caret on `spare`, and the quoting advice.
+        assert_eq!(
+            result.stderr_as_displayed(),
+            "\
+expr: syntax error: unexpected argument 'spare'
+   ╭─[ expr:1:7 ]
+   │
+ 1 │ 6 + 7 spare
+   │       ──┬──
+   │         ╰──── the expression was already complete here
+   │
+   │ Help: the shell may have expanded an operator; quote it as '*' or escape it as \\*
+───╯"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_snippet_points_at_the_dangling_operator() {
+        let result = new_ucmd!()
+            .terminal_sim_stderr()
+            .args(&["6", "*"])
+            .fails_with_code(2);
+
+        assert_eq!(
+            result.stderr_as_displayed(),
+            "\
+expr: syntax error: missing argument after '*'
+   ╭─[ expr:1:3 ]
+   │
+ 1 │ 6 *
+   │   ─
+   │
+   │ Help: every operator needs a value on both sides
+───╯"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_snippet_points_at_the_non_integer_operand() {
+        let result = new_ucmd!()
+            .terminal_sim_stderr()
+            .args(&["oops", "+", "4"])
+            .fails_with_code(2);
+
+        assert_eq!(
+            result.stderr_as_displayed(),
+            "\
+expr: non-integer argument
+   ╭─[ expr:1:1 ]
+   │
+ 1 │ oops + 4
+   │ ────
+   │
+   │ Help: arithmetic operators need integers; use = or != to compare strings instead
+───╯"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unclosed_parenthesis_points_at_the_last_operand() {
+        let result = new_ucmd!()
+            .terminal_sim_stderr()
+            .args(&["(", "6", "+", "7"])
+            .fails_with_code(2);
+
+        // No help line here: the label alone says what should follow.
+        assert_eq!(
+            result.stderr_as_displayed(),
+            "\
+expr: syntax error: expecting ')' after '7'
+   ╭─[ expr:1:7 ]
+   │
+ 1 │ ( 6 + 7
+   │       ─
+───╯"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_errors_without_a_position_stay_plain() {
+        // Division by zero is raised once the expression is already parsed and
+        // carries no operand, so there is nothing to point at. The terminal
+        // turns `\n` into `\r\n`, which is undone before comparing.
+        let result = new_ucmd!()
+            .terminal_sim_stderr()
+            .args(&["6", "/", "0"])
+            .fails_with_code(2);
+        assert_eq!(
+            result.stderr_str().replace("\r\n", "\n"),
+            "expr: division by zero\n"
+        );
+        // An empty expression keeps its usage hint.
+        new_ucmd!()
+            .terminal_sim_stderr()
+            .fails_with_code(2)
+            .stderr_contains("missing operand")
+            .stderr_contains("for more information");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_snippet_points_at_the_operand_that_failed_not_its_twin() {
+        // Both operands read `a`, but only the right-hand one of `+` failed
+        // arithmetic; the caret must not drift to the first occurrence, a
+        // perfectly valid string operand of `=`.
+        let result = new_ucmd!()
+            .terminal_sim_stderr()
+            .args(&["a", "=", "2", "+", "a"])
+            .fails_with_code(2);
+
+        assert_eq!(
+            result.stderr_as_displayed(),
+            "\
+expr: non-integer argument
+   ╭─[ expr:1:9 ]
+   │
+ 1 │ a = 2 + a
+   │         ─
+   │
+   │ Help: arithmetic operators need integers; use = or != to compare strings instead
+───╯"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_computed_operand_stays_plain() {
+        // The failing operand is the result of `substr`, not an argument, so
+        // there is nothing to point at and the plain message is kept.
+        let result = new_ucmd!()
+            .terminal_sim_stderr()
+            .args(&["substr", "abc", "1", "2", "+", "1"])
+            .fails_with_code(2);
+        assert_eq!(
+            result.stderr_str().replace("\r\n", "\n"),
+            "expr: non-integer argument\n"
+        );
+    }
+
+    #[test]
+    fn test_plain_message_is_the_default() {
+        // The test harness pipes stderr, so the report must not appear.
+        new_ucmd!()
+            .args(&["6", "+", "7", "spare"])
+            .fails_with_code(2)
+            .stderr_is("expr: syntax error: unexpected argument 'spare'\n");
+    }
 }

@@ -276,6 +276,25 @@ FIRST!SECOND@THIRD#FOURTH!ABCDEFG
     }
 }
 
+// With `-s`, each input file is written as its own output line, so the
+// delimiter list must restart from its first element for every file instead
+// of carrying the cycle over from the previous one.
+#[test]
+fn test_serial_delimiter_list_resets_per_file() {
+    for option_style in ["-d", "--delimiters"] {
+        for serial in ["-s", "--serial"] {
+            let (at, mut ucmd) = at_and_ucmd!();
+            at.write("f1", "a\nb\n");
+            at.write("f2", "c\nd\ne\n");
+            at.write("f3", "f\ng\n");
+
+            ucmd.args(&[option_style, ":|", serial, "f1", "f2", "f3"])
+                .succeeds()
+                .stdout_only("a:b\nc:d|e\nf:g\n");
+        }
+    }
+}
+
 #[test]
 #[cfg(unix)]
 fn test_non_utf8_input() {
@@ -374,9 +393,12 @@ fn test_gnu_escape_sequences() {
 // As of 2024-10-09, only bsdutils (https://github.com/dcantrell/bsdutils, derived from FreeBSD) and toybox handle
 // multibyte delimiter characters in the way a user would likely expect. BusyBox and GNU Core Utilities do not.
 #[test]
+#[cfg_attr(wasi_runner, ignore = "WASI: the guest does not inherit LC_ALL")]
 fn test_multi_byte_delimiter() {
     for option_style in ["-d", "--delimiters"] {
         new_ucmd!()
+            // A multibyte delimiter is stepped per character in a UTF-8 locale.
+            .env("LC_ALL", "C.UTF-8")
             .args(&[option_style, "!ß@", "-s"])
             .pipe_in(
                 "\
@@ -398,6 +420,7 @@ fn test_multi_byte_delimiter() {
 }
 
 #[test]
+#[cfg_attr(wasi_runner, ignore = "WASI: the guest does not inherit LC_ALL")]
 fn test_data() {
     for example in EXAMPLE_DATA {
         let (at, mut ucmd) = at_and_ucmd!();
@@ -408,7 +431,9 @@ fn test_data() {
             ins.push(file);
         }
         println!("{}", example.name);
-        ucmd.args(example.args)
+        // Some examples use multibyte delimiters, which need a UTF-8 locale.
+        ucmd.env("LC_ALL", "C.UTF-8")
+            .args(example.args)
             .args(&ins)
             .succeeds()
             .stdout_is(example.out);
@@ -417,6 +442,7 @@ fn test_data() {
 
 #[test]
 #[cfg(target_os = "linux")]
+#[cfg_attr(wasi_runner, ignore = "WASI: argv/filenames must be valid UTF-8")]
 fn test_non_utf8_delimiter() {
     let (at, mut ucmd) = at_and_ucmd!();
     at.write("f1", "1\n2\n");
@@ -432,6 +458,7 @@ fn test_non_utf8_delimiter() {
 
 #[test]
 #[cfg(target_os = "linux")]
+#[cfg_attr(wasi_runner, ignore = "WASI: argv/filenames must be valid UTF-8")]
 fn test_paste_non_utf8_paths() {
     let (at, mut ucmd) = at_and_ucmd!();
 
@@ -445,4 +472,41 @@ fn test_paste_non_utf8_paths() {
         .arg(&filename2)
         .succeeds()
         .stdout_is("line1\tcol1\nline2\tcol2\n");
+}
+
+#[cfg(target_os = "linux")]
+fn make_broken_pipe() -> std::io::PipeWriter {
+    let (read, write) = std::io::pipe().expect("Failed to create pipe");
+    // Drop the read end so writes fail with EPIPE.
+    drop(read);
+    // Return the write end of the pipe
+    write
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+#[cfg_attr(wasi_runner, ignore = "WASI sandbox: host paths (/dev) not visible")]
+fn test_dev_zero_write_error_dev_full() {
+    use std::fs::File;
+
+    let dev_full =
+        File::create("/dev/full").expect("Failed to open /dev/full - test must run on Linux");
+
+    new_ucmd!()
+        .arg("/dev/zero")
+        .set_stdout(dev_full)
+        .fails()
+        .code_is(1)
+        .stderr_contains("No space left on device");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+#[cfg_attr(wasi_runner, ignore = "WASI sandbox: host paths (/dev) not visible")]
+fn test_dev_zero_closed_pipe() {
+    new_ucmd!()
+        .arg("/dev/zero")
+        .set_stdout(make_broken_pipe())
+        .run()
+        .fails_silently();
 }

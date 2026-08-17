@@ -9,8 +9,8 @@
 //! This module provides functionality to preserve hardlink relationships
 //! when moving files across different filesystems/partitions.
 
-use std::collections::HashMap;
-use std::io;
+use rustc_hash::FxHashMap;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 use uucore::display::Quotable;
@@ -19,14 +19,14 @@ use uucore::display::Quotable;
 #[derive(Debug, Default)]
 pub struct HardlinkTracker {
     /// Maps (device, inode) -> destination path for the first occurrence
-    inode_map: HashMap<(u64, u64), PathBuf>,
+    inode_map: FxHashMap<(u64, u64), PathBuf>,
 }
 
 /// Pre-scans files to identify hardlink groups with optimized memory usage
 #[derive(Debug, Default)]
 pub struct HardlinkGroupScanner {
     /// Maps (device, inode) -> list of source paths that are hardlinked together
-    hardlink_groups: HashMap<(u64, u64), Vec<PathBuf>>,
+    hardlink_groups: FxHashMap<(u64, u64), Vec<PathBuf>>,
     /// List of source files/directories being moved (for destination mapping)
     source_files: Vec<PathBuf>,
     /// Whether scanning has been performed
@@ -126,7 +126,11 @@ impl HardlinkTracker {
             Err(e) => {
                 // Gracefully handle metadata errors by logging and continuing without hardlink tracking
                 if options.verbose {
-                    eprintln!("warning: cannot get metadata for {}: {e}", source.quote());
+                    let _ = writeln!(
+                        io::stderr(),
+                        "warning: cannot get metadata for {}: {e}",
+                        source.quote()
+                    );
                 }
                 return None;
             }
@@ -144,7 +148,8 @@ impl HardlinkTracker {
 
             if has_hardlinks {
                 if options.verbose {
-                    eprintln!(
+                    let _ = writeln!(
+                        io::stderr(),
                         "preserving hardlink {} -> {} (hardlinked)",
                         source.quote(),
                         existing_path.quote()
@@ -176,11 +181,15 @@ impl HardlinkGroupScanner {
         self.source_files = files.to_vec();
 
         for file in files {
-            if let Err(e) = self.scan_single_path(file) {
-                if options.verbose {
-                    // Only show warnings for verbose mode
-                    eprintln!("warning: failed to scan {}: {e}", file.quote());
-                }
+            if let Err(e) = self.scan_single_path(file)
+                && options.verbose
+            {
+                // Only show warnings for verbose mode
+                let _ = writeln!(
+                    io::stderr(),
+                    "warning: failed to scan {}: {e}",
+                    file.quote()
+                );
                 // For non-verbose mode, silently continue for missing files
                 // This provides graceful degradation - we'll lose hardlink info for this file
                 // but can still preserve hardlinks for other files
@@ -192,9 +201,11 @@ impl HardlinkGroupScanner {
         if options.verbose {
             let stats = self.stats();
             if stats.total_groups > 0 {
-                eprintln!(
+                let _ = writeln!(
+                    io::stderr(),
                     "found {} hardlink groups with {} total files",
-                    stats.total_groups, stats.total_files
+                    stats.total_groups,
+                    stats.total_files
                 );
             }
         }
@@ -265,7 +276,7 @@ impl HardlinkGroupScanner {
     #[cfg(unix)]
     pub fn stats(&self) -> ScannerStats {
         let total_groups = self.hardlink_groups.len();
-        let total_files = self.hardlink_groups.values().map(|group| group.len()).sum();
+        let total_files = self.hardlink_groups.values().map(Vec::len).sum();
 
         ScannerStats {
             total_groups,

@@ -1054,8 +1054,7 @@ fn test_nonexistent_file() {
 fn test_df_all_shows_binfmt_misc() {
     // Check if binfmt_misc is mounted
     let is_mounted = std::fs::read_to_string("/proc/self/mountinfo")
-        .map(|content| content.lines().any(|line| line.contains("binfmt_misc")))
-        .unwrap_or(false);
+        .is_ok_and(|content| content.lines().any(|line| line.contains("binfmt_misc")));
 
     if is_mounted {
         let output = new_ucmd!()
@@ -1076,8 +1075,7 @@ fn test_df_all_shows_binfmt_misc() {
 fn test_df_hides_binfmt_misc_by_default() {
     // Check if binfmt_misc is mounted
     let is_mounted = std::fs::read_to_string("/proc/self/mountinfo")
-        .map(|content| content.lines().any(|line| line.contains("binfmt_misc")))
-        .unwrap_or(false);
+        .is_ok_and(|content| content.lines().any(|line| line.contains("binfmt_misc")));
 
     if is_mounted {
         let output = new_ucmd!()
@@ -1101,13 +1099,11 @@ fn run_df_with_masked_proc(args: &str) -> Option<(bool, String, String)> {
     use std::process::Command;
 
     // Check if user namespaces are available
-    if !Command::new("unshare")
+    Command::new("unshare")
         .args(["-rm", "true"])
         .status()
-        .is_ok_and(|s| s.success())
-    {
-        return None;
-    }
+        .ok()
+        .filter(std::process::ExitStatus::success)?;
 
     let df_path = TestScenario::new("df").bin_path.clone();
     let output = Command::new("unshare")

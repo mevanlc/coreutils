@@ -310,7 +310,9 @@ fn comm(
         .map_err_context(|| translate!("comm-error-write"))?;
     }
 
-    writer.flush().ok();
+    writer
+        .flush()
+        .map_err_context(|| translate!("comm-error-write"))?;
 
     if should_check_order && (checker1.has_error || checker2.has_error) {
         // Print the input error message once at the end
@@ -327,7 +329,10 @@ fn open_file(name: &OsString, line_ending: LineEnding) -> io::Result<LineReader>
     if name == "-" {
         Ok(LineReader::new(Input::stdin(), line_ending))
     } else {
-        if metadata(name)?.is_dir() {
+        // some platforms shows different read error
+        // try to override the error message, but failure of it is not serious
+        #[cfg(any(target_os = "wasi", target_os = "windows"))]
+        if metadata(name).is_ok_and(|m| m.is_dir()) {
             return Err(io::Error::other(translate!("comm-error-is-directory")));
         }
         let f = File::open(name)?;
@@ -372,9 +377,9 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
 }
 
 pub fn uu_app() -> Command {
-    Command::new(uucore::util_name())
+    Command::new("comm")
         .version(uucore::crate_version!())
-        .help_template(uucore::localized_help_template(uucore::util_name()))
+        .help_template(uucore::localized_help_template("comm"))
         .about(translate!("comm-about"))
         .override_usage(format_usage(&translate!("comm-usage")))
         .infer_long_args(true)

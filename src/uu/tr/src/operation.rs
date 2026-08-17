@@ -3,7 +3,7 @@
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 
-// spell-checker:ignore (strings) anychar combinator Alnum Punct Xdigit alnum punct xdigit cntrl
+// spell-checker:ignore (strings) anychar combinator Alnum Punct Xdigit alnum punct xdigit cntrl alpah
 
 use crate::unicode_table;
 use nom::{
@@ -12,7 +12,7 @@ use nom::{
     bytes::complete::{tag, take, take_till, take_until},
     character::complete::one_of,
     combinator::{map, map_opt, peek, recognize, value},
-    multi::{many_m_n, many0},
+    multi::many_m_n,
     sequence::{delimited, preceded, separated_pair, terminated},
 };
 use std::{
@@ -20,6 +20,7 @@ use std::{
     error::Error,
     fmt::{Debug, Display},
     io::{BufRead, Write},
+    ops::Range,
 };
 use uucore::error::{FromIo, UError, UResult};
 use uucore::translate;
@@ -34,6 +35,7 @@ pub trait ChunkProcessor {
 #[derive(Debug, Clone)]
 pub enum BadSequence {
     MissingCharClassName,
+    InvalidCharClass(String),
     MissingEquivalentClassChar,
     MultipleCharRepeatInSet2,
     CharRepeatInSet1,
@@ -47,11 +49,28 @@ pub enum BadSequence {
     MultipleCharInEquivalence(String),
 }
 
+/// A range endpoint, printed the way the shell would show it: as itself for
+/// printable ASCII — backslash-escaped where Rust escapes it, so `\` and the
+/// quotes come back doubled — and as an octal escape otherwise.
+pub(crate) fn range_endpoint_to_string(ut: u32) -> String {
+    match char::from_u32(ut) {
+        Some(ch @ '\x20'..='\x7E') => ch.escape_default().to_string(),
+        _ => format!("\\{ut:03o}"),
+    }
+}
+
 impl Display for BadSequence {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingCharClassName => {
                 write!(f, "{}", translate!("tr-error-missing-char-class-name"))
+            }
+            Self::InvalidCharClass(class) => {
+                write!(
+                    f,
+                    "{}",
+                    translate!("tr-error-invalid-char-class", "class" => format!("'{}'", class))
+                )
             }
             Self::MissingEquivalentClassChar => {
                 write!(
@@ -105,18 +124,10 @@ impl Display for BadSequence {
                 )
             }
             Self::BackwardsRange { end, start } => {
-                fn end_or_start_to_string(ut: u32) -> String {
-                    match char::from_u32(ut) {
-                        Some(ch @ '\x20'..='\x7E') => ch.escape_default().to_string(),
-                        _ => {
-                            format!("\\{ut:03o}")
-                        }
-                    }
-                }
                 write!(
                     f,
                     "{}",
-                    translate!("tr-error-backwards-range", "start" => end_or_start_to_string(*start), "end" => end_or_start_to_string(*end))
+                    translate!("tr-error-backwards-range", "start" => range_endpoint_to_string(*start), "end" => range_endpoint_to_string(*end))
                 )
             }
             Self::MultipleCharInEquivalence(s) => write!(
@@ -129,7 +140,46 @@ impl Display for BadSequence {
 }
 
 impl Error for BadSequence {}
+
 impl UError for BadSequence {}
+
+/// A [`BadSequence`] together with where it was written.
+///
+/// A set is a small language of its own, so naming the set and the sequence
+/// inside it says far more than the message alone: `[:alpah:]` and `[a-Z]` are
+/// both "in SET1", but only one character of each is actually wrong.
+#[derive(Debug, Clone)]
+pub struct SequenceError {
+    pub error: BadSequence,
+    /// Which set the problem is in, numbered as the operands are: 1 or 2.
+    pub set: u8,
+    /// Byte range inside that set, or `None` when the set as a whole is at
+    /// fault rather than one sequence in it.
+    pub span: Option<Range<usize>>,
+}
+
+impl SequenceError {
+    /// A problem with a set taken as a whole.
+    fn whole_set(error: BadSequence, set: u8) -> Self {
+        Self {
+            error,
+            set,
+            span: None,
+        }
+    }
+}
+
+impl Display for SequenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The location is for the caret only; the message reads as it always
+        // has.
+        Display::fmt(&self.error, f)
+    }
+}
+
+impl Error for SequenceError {}
+
+impl UError for SequenceError {}
 
 #[derive(Debug, Clone, Copy)]
 pub enum Class {
@@ -177,8 +227,7 @@ impl Sequence {
                         .chain(33..=47)
                         .chain(58..=64)
                         .chain(91..=96)
-                        .chain(123..=126)
-                        .chain(std::iter::once(32)), // space
+                        .chain(123..=126),
                 ),
                 Class::Print => Box::new(
                     (48..=57) // digit
@@ -188,7 +237,8 @@ impl Sequence {
                         .chain(33..=47)
                         .chain(58..=64)
                         .chain(91..=96)
-                        .chain(123..=126),
+                        .chain(123..=126)
+                        .chain(std::iter::once(32)), // space
                 ),
                 Class::Punct => Box::new((33..=47).chain(58..=64).chain(91..=96).chain(123..=126)),
                 Class::Space => Box::new(unicode_table::SPACES.iter().copied()),
@@ -206,17 +256,28 @@ impl Sequence {
         complement_flag: bool,
         truncate_set1_flag: bool,
         translating: bool,
-    ) -> Result<(Vec<u8>, Vec<u8>), BadSequence> {
+    ) -> Result<(Vec<u8>, Vec<u8>), SequenceError> {
         let is_char_star = |s: &&Self| -> bool { matches!(s, Self::CharStar(_)) };
 
-        let set1 = Self::from_str(set1_str)?;
+        let set1 = Self::parse_set(set1_str).map_err(|(error, span)| SequenceError {
+            error,
+            set: 1,
+            span: Some(span),
+        })?;
         if set1.iter().filter(is_char_star).count() != 0 {
-            return Err(BadSequence::CharRepeatInSet1);
+            return Err(SequenceError::whole_set(BadSequence::CharRepeatInSet1, 1));
         }
 
-        let mut set2 = Self::from_str(set2_str)?;
+        let mut set2 = Self::parse_set(set2_str).map_err(|(error, span)| SequenceError {
+            error,
+            set: 2,
+            span: Some(span),
+        })?;
         if set2.iter().filter(is_char_star).count() > 1 {
-            return Err(BadSequence::MultipleCharRepeatInSet2);
+            return Err(SequenceError::whole_set(
+                BadSequence::MultipleCharRepeatInSet2,
+                2,
+            ));
         }
 
         if translating
@@ -225,7 +286,10 @@ impl Sequence {
                     && !matches!(x, Self::Class(Class::Upper | Class::Lower))
             })
         {
-            return Err(BadSequence::ClassExceptLowerUpperInSet2);
+            return Err(SequenceError::whole_set(
+                BadSequence::ClassExceptLowerUpperInSet2,
+                2,
+            ));
         }
 
         let mut set1_solved: Vec<u8> = set1.iter().flat_map(Self::flatten).collect();
@@ -280,7 +344,10 @@ impl Sequence {
                 }
 
                 if !class_matches {
-                    return Err(BadSequence::ClassInSet2NotMatchedBySet1);
+                    return Err(SequenceError::whole_set(
+                        BadSequence::ClassInSet2NotMatchedBySet1,
+                        2,
+                    ));
                 }
             }
         }
@@ -292,53 +359,111 @@ impl Sequence {
         set2_uniques.sort_unstable();
         set2_uniques.dedup();
 
+        let set1_has_class = set1.iter().any(|x| matches!(x, Self::Class(_)));
         // If the complement flag is used in translate mode, only one unique
         // character may appear in set2. Validate this with the set of uniques
         // in set2 that we just generated.
         // Also, set2 must not overgrow set1, otherwise the mapping can't be 1:1.
-        if set1.iter().any(|x| matches!(x, Self::Class(_)))
+        if set1_has_class
             && translating
             && complement_flag
             && (set2_uniques.len() > 1 || set2_solved.len() > set1_len)
         {
-            return Err(BadSequence::ComplementMoreThanOneUniqueInSet2);
+            return Err(SequenceError::whole_set(
+                BadSequence::ComplementMoreThanOneUniqueInSet2,
+                2,
+            ));
         }
 
-        if set2_solved.len() < set1_solved.len()
-            && !truncate_set1_flag
-            && matches!(
+        if set2_solved.len() < set1_solved.len() {
+            if truncate_set1_flag {
+                if complement_flag && set1_has_class {
+                    // GNU applies -t before complementing a character class.
+                    // That means we must first truncate the expanded, non-complemented
+                    // source set, then complement the truncated prefix to recover the
+                    // final translation domain.
+                    let truncated_set1: Vec<_> = set1
+                        .iter()
+                        .flat_map(Self::flatten)
+                        .take(set2_solved.len())
+                        .collect();
+                    set1_solved = (0..=u8::MAX)
+                        .filter(|x| !truncated_set1.contains(x))
+                        .collect();
+                    // After expansion the complemented domain may be larger than set2.
+                    // Re-check the complement validity constraint.
+                    if set2_uniques.len() > 1 || set1_solved.len() > set2_solved.len() {
+                        return Err(SequenceError::whole_set(
+                            BadSequence::ComplementMoreThanOneUniqueInSet2,
+                            2,
+                        ));
+                    }
+                } else {
+                    set1_solved.truncate(set2_solved.len());
+                }
+            } else if matches!(
                 set2.last().copied(),
                 Some(Self::Class(Class::Upper | Class::Lower))
-            )
-        {
-            return Err(BadSequence::Set1LongerSet2EndsInClass);
+            ) {
+                return Err(SequenceError::whole_set(
+                    BadSequence::Set1LongerSet2EndsInClass,
+                    1,
+                ));
+            }
         }
-        //Truncation is done dead last. It has no influence on the other conversion steps
-        if truncate_set1_flag {
-            set1_solved.truncate(set2_solved.len());
-        }
+
         Ok((set1_solved, set2_solved))
     }
 }
 
 impl Sequence {
-    pub fn from_str(input: &[u8]) -> Result<Vec<Self>, BadSequence> {
-        many0(alt((
-            Self::parse_char_range,
-            Self::parse_char_star,
-            Self::parse_char_repeat,
-            Self::parse_class,
-            Self::parse_char_equal,
-            // NOTE: This must be the last one
-            map(Self::parse_backslash_or_char_with_warning, |s| {
-                Ok(Self::Char(s))
-            }),
-        )))
-        .parse(input)
-        .map(|(_, r)| r)
-        .unwrap()
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()
+    /// Parse a set, reporting which part of it a bad sequence occupies.
+    ///
+    /// The alternatives are tried in the same order as before; the loop only
+    /// replaces `many0` so that how much each sequence consumed is still known
+    /// once it turns out to be wrong. Like `many0`, it consumes the whole set
+    /// even past a bad sequence: parsing the tail emits the warnings — an
+    /// ambiguous octal escape, invalid UTF-8 — that it always has.
+    fn parse_set(input: &[u8]) -> Result<Vec<Self>, (BadSequence, Range<usize>)> {
+        let mut result = Vec::new();
+        let mut first_error = None;
+        let mut rest = input;
+        while !rest.is_empty() {
+            let start = input.len() - rest.len();
+            let parsed = alt((
+                Self::parse_char_range,
+                Self::parse_char_star,
+                Self::parse_char_repeat,
+                Self::parse_class,
+                Self::parse_char_equal,
+                // NOTE: This must be the last one
+                map(Self::parse_backslash_or_char_with_warning, |s| {
+                    Ok(Self::Char(s))
+                }),
+            ))
+            .parse(rest);
+            // The last alternative accepts any single byte, so this only
+            // happens on input the loop has already run out of.
+            let Ok((next, sequence)) = parsed else { break };
+            // `many0` refuses an alternative that matched nothing rather than
+            // loop on it forever; none of the ones above can, but the loop is
+            // no place to find out if one ever does.
+            if next.len() == rest.len() {
+                break;
+            }
+            let end = input.len() - next.len();
+            match sequence {
+                Ok(sequence) => result.push(sequence),
+                Err(error) => {
+                    first_error.get_or_insert((error, start..end));
+                }
+            }
+            rest = next;
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(result),
+        }
     }
 
     fn parse_octal(input: &[u8]) -> IResult<&[u8], u8> {
@@ -501,31 +626,31 @@ impl Sequence {
     }
 
     fn parse_class(input: &[u8]) -> IResult<&[u8], Result<Self, BadSequence>> {
-        delimited(
-            tag("[:"),
-            alt((
-                map(
-                    alt((
-                        value(Self::Class(Class::Alnum), tag("alnum")),
-                        value(Self::Class(Class::Alpha), tag("alpha")),
-                        value(Self::Class(Class::Blank), tag("blank")),
-                        value(Self::Class(Class::Control), tag("cntrl")),
-                        value(Self::Class(Class::Digit), tag("digit")),
-                        value(Self::Class(Class::Graph), tag("graph")),
-                        value(Self::Class(Class::Lower), tag("lower")),
-                        value(Self::Class(Class::Print), tag("print")),
-                        value(Self::Class(Class::Punct), tag("punct")),
-                        value(Self::Class(Class::Space), tag("space")),
-                        value(Self::Class(Class::Upper), tag("upper")),
-                        value(Self::Class(Class::Xdigit), tag("xdigit")),
-                    )),
-                    Ok,
-                ),
-                value(Err(BadSequence::MissingCharClassName), tag("")),
-            )),
-            tag(":]"),
-        )
-        .parse(input)
+        preceded(tag("[:"), terminated(take_until(":]"), tag(":]")))
+            .parse(input)
+            .map(|(l, class_name)| {
+                (
+                    l,
+                    match class_name {
+                        b"" => Err(BadSequence::MissingCharClassName),
+                        b"alnum" => Ok(Self::Class(Class::Alnum)),
+                        b"alpha" => Ok(Self::Class(Class::Alpha)),
+                        b"blank" => Ok(Self::Class(Class::Blank)),
+                        b"cntrl" => Ok(Self::Class(Class::Control)),
+                        b"digit" => Ok(Self::Class(Class::Digit)),
+                        b"graph" => Ok(Self::Class(Class::Graph)),
+                        b"lower" => Ok(Self::Class(Class::Lower)),
+                        b"print" => Ok(Self::Class(Class::Print)),
+                        b"punct" => Ok(Self::Class(Class::Punct)),
+                        b"space" => Ok(Self::Class(Class::Space)),
+                        b"upper" => Ok(Self::Class(Class::Upper)),
+                        b"xdigit" => Ok(Self::Class(Class::Xdigit)),
+                        _ => Err(BadSequence::InvalidCharClass(
+                            String::from_utf8_lossy(class_name).into_owned(),
+                        )),
+                    },
+                )
+            })
     }
 
     fn parse_char_equal(input: &[u8]) -> IResult<&[u8], Result<Self, BadSequence>> {
@@ -663,6 +788,8 @@ impl TranslateOperation {
             // Identity mapping for empty sets
             Ok(Self { translation_table })
         } else {
+            // Raised against the solved sets rather than what was typed, so
+            // there is nothing to point a caret at.
             Err(BadSequence::EmptySet2WhenNotTruncatingSet1)
         }
     }

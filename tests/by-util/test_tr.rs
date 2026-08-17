@@ -2,7 +2,7 @@
 //
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
-// spell-checker:ignore aabbaa aabbcc aabc abbb abbbcddd abcc abcdefabcdef abcdefghijk abcdefghijklmn abcdefghijklmnop ABCDEFGHIJKLMNOPQRS abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ ABCDEFZZ abcxyz ABCXYZ abcxyzabcxyz ABCXYZABCXYZ acbdef alnum amzamz AMZXAMZ bbbd cclass cefgm cntrl compl dabcdef dncase Gzabcdefg PQRST upcase wxyzz xdigit XXXYYY xycde xyyye xyyz xyzzzzxyzzzz ZABCDEF Zamz Cdefghijkl Cdefghijklmn asdfqqwweerr qwerr asdfqwer qwer aassddffqwer asdfqwer
+// spell-checker:ignore lowre punct aabbaa aabbcc aabc abbb abbbcddd abcc abcdefabcdef abcdefghijk abcdefghijklmn abcdefghijklmnop ABCDEFGHIJKLMNOPQRS abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ ABCDEFZZ abcxyz ABCXYZ abcxyzabcxyz ABCXYZABCXYZ acbdef alnum amzamz AMZXAMZ bbbd cclass cefgm cntrl compl dabcdef dncase fooclass Gzabcdefg PQRST upcase wxyzz xdigit XXXYYY xycde xyyye xyyz xyzzzzxyzzzz ZABCDEF Zamz Cdefghijkl Cdefghijklmn asdfqqwweerr qwerr asdfqwer qwer aassddffqwer asdfqwer
 use uutests::at_and_ucmd;
 use uutests::new_ucmd;
 
@@ -21,12 +21,20 @@ fn test_invalid_input() {
         .fails_with_code(1)
         .stderr_contains("tr: extra operand '<'");
     #[cfg(unix)]
-    new_ucmd!()
-        .args(&["1", "1"])
-        // will test "tr 1 1 < ."
-        .set_stdin(std::process::Stdio::from(std::fs::File::open(".").unwrap()))
-        .fails_with_code(1)
-        .stderr_contains("tr: read error: Is a directory");
+    {
+        let cmd = new_ucmd!()
+            .args(&["1", "1"])
+            // will test "tr 1 1 < ."
+            .set_stdin(std::process::Stdio::from(std::fs::File::open(".").unwrap()))
+            .fails_with_code(1);
+        if std::env::var("UUTESTS_WASM_RUNNER").is_ok() {
+            // On WASI the fluent translation key may appear instead of the
+            // translated text, but the OS error string is still present.
+            cmd.stderr_contains("Is a directory");
+        } else {
+            cmd.stderr_contains("tr: read error: Is a directory");
+        }
+    }
 }
 
 #[test]
@@ -63,6 +71,38 @@ fn test_delete() {
         .pipe_in("aBcD")
         .succeeds()
         .stdout_is("BD");
+}
+
+#[test]
+fn test_delete_graph_and_print_match_gnu() {
+    let input = *b" A!\t\n";
+    new_ucmd!()
+        .args(&["-d", "[:graph:]"])
+        .pipe_in(input)
+        .succeeds()
+        .stdout_is_bytes(*b" \t\n");
+
+    new_ucmd!()
+        .args(&["-d", "[:print:]"])
+        .pipe_in(input)
+        .succeeds()
+        .stdout_is_bytes(*b"\t\n");
+}
+
+#[test]
+fn test_delete_complement_graph_and_print_match_gnu() {
+    let input = *b" A!\t\n";
+    new_ucmd!()
+        .args(&["-d", "-c", "[:graph:]"])
+        .pipe_in(input)
+        .succeeds()
+        .stdout_is_bytes(*b"A!");
+
+    new_ucmd!()
+        .args(&["-d", "-c", "[:print:]"])
+        .pipe_in(input)
+        .succeeds()
+        .stdout_is_bytes(*b" A!");
 }
 
 #[test]
@@ -339,6 +379,16 @@ fn test_truncate_with_set1_shorter_than_set2() {
         .pipe_in("abcde")
         .succeeds()
         .stdout_is("xycde");
+}
+
+#[test]
+fn test_truncate_applies_before_complement_with_class() {
+    new_ucmd!()
+        .args(&["-ct", "[:digit:]", "X"])
+        .ignore_stdin_write_error()
+        .pipe_in("A")
+        .fails()
+        .stderr_contains("when translating with complemented character classes,\nstring2 must map all characters in the domain to one");
 }
 
 #[test]
@@ -1186,6 +1236,15 @@ fn check_against_gnu_tr_tests_empty_cc() {
 }
 
 #[test]
+fn check_against_gnu_tr_tests_invalid_cc() {
+    new_ucmd!()
+        .args(&["[:fooclass:]", "x"])
+        .pipe_in("")
+        .fails()
+        .stderr_is("tr: invalid character class 'fooclass'\n");
+}
+
+#[test]
 fn check_against_gnu_tr_tests_repeat_set1() {
     new_ucmd!()
         .args(&["[a*]", "a"])
@@ -1455,6 +1514,7 @@ fn check_complement_set2_too_big() {
 
 #[test]
 #[cfg(unix)]
+#[cfg_attr(wasi_runner, ignore = "WASI: argv/filenames must be valid UTF-8")]
 fn test_truncate_non_utf8_set() {
     let stdin = b"\x01amp\xfe\xff";
     let set1 = OsStr::from_bytes(b"a\xfe\xffz"); // spell-checker:disable-line
@@ -1524,6 +1584,22 @@ fn test_multibyte_octal_sequence() {
 }
 
 #[test]
+fn test_octal_warning_still_fires_after_a_bad_sequence() {
+    // The set fails on the character class, but the ambiguous octal escape
+    // after it must still be warned about: the whole set is parsed even when
+    // an earlier sequence is bad.
+    // No `pipe_in`: the sets are rejected before stdin is ever read, so
+    // handing the child input only races its exit.
+    new_ucmd!()
+        .args(&[r"[:foo:]\400", "y"])
+        .fails()
+        .stderr_is(
+            "tr: warning: the ambiguous octal escape \\400 is being interpreted as the 2-byte sequence \\040, 0\n\
+             tr: invalid character class 'foo'\n",
+        );
+}
+
+#[test]
 fn test_backwards_range() {
     new_ucmd!()
         .args(&["-d", r"\046-\048"])
@@ -1546,6 +1622,7 @@ fn test_non_digit_repeat() {
 
 #[test]
 #[cfg(unix)]
+#[cfg_attr(wasi_runner, ignore = "WASI: argv/filenames must be valid UTF-8")]
 fn test_octal_escape_ambiguous_followed_by_non_utf8() {
     // This case does not trigger the panic
     let set1 = OsStr::from_bytes(b"\\501a");
@@ -1580,6 +1657,7 @@ fn test_failed_write_is_reported() {
 }
 
 #[test]
+#[cfg_attr(wasi_runner, ignore = "WASI: no pipe/signal support")]
 fn test_broken_pipe_no_error() {
     new_ucmd!()
         .args(&["e", "a"])
@@ -1588,23 +1666,177 @@ fn test_broken_pipe_no_error() {
         .fails_silently();
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 #[test]
 fn test_stdin_is_socket() {
-    use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
-    use nix::unistd::write;
+    use std::io::Write as _;
 
-    let (fd1, fd2) = socketpair(
-        AddressFamily::Unix,
-        SockType::Stream,
+    let (fd1, fd2) = rustix::net::socketpair(
+        rustix::net::AddressFamily::UNIX,
+        rustix::net::SocketType::STREAM,
+        rustix::net::SocketFlags::empty(),
         None,
-        SockFlag::empty(),
     )
     .unwrap();
-    write(fd1, b"::").unwrap();
+    std::fs::File::from(fd1).write_all(b"::").unwrap();
     new_ucmd!()
         .args(&[":", ";"])
         .set_stdin(fd2)
         .succeeds()
         .stdout_is(";;");
+}
+
+#[cfg(all(feature = "feat_diagnostics", not(wasi_runner)))]
+mod diagnostics {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_snippet_points_at_the_misspelled_class() {
+        let result = new_ucmd!()
+            .terminal_sim_stderr()
+            .args(&["w[:lowre:]w", "x"])
+            .fails_with_code(1);
+
+        // The whole report: the `tr: ` prefix of the plain form, the argument
+        // list echoed back, a caret covering `[:lowre:]` only — not the whole
+        // set — and the list of valid class names.
+        assert_eq!(
+            result.stderr_as_displayed(),
+            "\
+tr: invalid character class 'lowre'
+   ╭─[ tr:1:5 ]
+   │
+ 1 │ tr w[:lowre:]w x
+   │     ─────────
+   │
+   │ Help: classes are alnum, alpha, blank, cntrl, digit, graph, lower, print, punct, space, upper and xdigit
+───╯"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_snippet_points_at_the_backwards_range() {
+        let result = new_ucmd!()
+            .terminal_sim_stderr()
+            .args(&["qw[y-b]", "x"])
+            .fails_with_code(1);
+
+        // The caret covers `y-b` alone, not the letters around the range.
+        assert_eq!(
+            result.stderr_as_displayed(),
+            "\
+tr: range-endpoints of 'y-b' are in reverse collating sequence order
+   ╭─[ tr:1:7 ]
+   │
+ 1 │ tr qw[y-b] x
+   │       ─┬─
+   │        ╰─── did you mean 'b-y'?
+   │
+   │ Help: a range goes from the lower character to the higher one, as in a-z
+───╯"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_snippet_points_at_the_repeat_count() {
+        let result = new_ucmd!()
+            .terminal_sim_stderr()
+            .args(&["wxy", "[z*4k]"])
+            .fails_with_code(1);
+
+        assert_eq!(
+            result.stderr_as_displayed(),
+            "\
+tr: invalid repeat count '4k' in [c*n] construct
+   ╭─[ tr:1:8 ]
+   │
+ 1 │ tr wxy [z*4k]
+   │        ──────
+   │
+   │ Help: [c*N] repeats c N times, [c*] pads SET2 to the length of SET1
+───╯"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_snippet_underlines_the_whole_set_when_the_set_is_at_fault() {
+        let result = new_ucmd!()
+            .terminal_sim_stderr()
+            .args(&["w[q*]", "xyz"])
+            .fails_with_code(1);
+
+        // Nothing inside the set is wrong on its own, so all of it is marked.
+        assert_eq!(
+            result.stderr_as_displayed(),
+            "\
+tr: the [c*] repeat construct may not appear in string1
+   ╭─[ tr:1:4 ]
+   │
+ 1 │ tr w[q*] xyz
+   │    ─────
+   │
+   │ Help: [c*N] repeats c N times, [c*] pads SET2 to the length of SET1
+───╯"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_snippet_points_into_the_second_set() {
+        let result = new_ucmd!()
+            .terminal_sim_stderr()
+            .args(&["[:lower:]", "q[=we=]"])
+            .fails_with_code(1);
+
+        // The set at fault is the second operand, not the first.
+        assert_eq!(
+            result.stderr_as_displayed(),
+            "\
+tr: we: equivalence class operand must be a single character
+   ╭─[ tr:1:15 ]
+   │
+ 1 │ tr [:lower:] q[=we=]
+   │               ──────
+   │
+   │ Help: [=c=] stands for every character equivalent to c
+───╯"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_snippet_ignores_the_program_name_as_a_set() {
+        // The second set reads exactly like the program name; the caret must
+        // stay on the operand, not drift onto `tr` at the start of the line.
+        let result = new_ucmd!()
+            .terminal_sim_stderr()
+            .args(&["-c", "[:alpha:]", "tr"])
+            .fails_with_code(1);
+
+        assert_eq!(
+            result.stderr_as_displayed(),
+            "\
+tr: when translating with complemented character classes,
+string2 must map all characters in the domain to one
+   ╭─[ tr:1:17 ]
+   │
+ 1 │ tr -c [:alpha:] tr
+   │                 ─┬
+   │                  ╰── only one character may be complemented to
+───╯"
+        );
+    }
+
+    #[test]
+    fn test_plain_message_when_stderr_is_a_pipe() {
+        // The test harness pipes stderr, so the report must not appear.
+        new_ucmd!()
+            .args(&["w[:lowre:]w", "x"])
+            .fails_with_code(1)
+            .stderr_only("tr: invalid character class 'lowre'\n");
+    }
 }

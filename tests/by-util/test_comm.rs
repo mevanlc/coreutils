@@ -309,7 +309,6 @@ fn zero_terminated_with_total() {
     }
 }
 
-#[ignore = "not implemented"]
 #[test]
 fn check_order() {
     let scene = TestScenario::new(util_name!());
@@ -320,36 +319,42 @@ fn check_order() {
         .ucmd()
         .args(&["--check-order", "bad_order_1", "bad_order_2"])
         .fails()
-        .stdout_is("\t\te")
-        .stderr_is("error to be defined");
+        .stdout_is("\t\te\n")
+        .stderr_is("comm: file 2 is not in sorted order\n");
 }
 
-#[ignore = "not implemented"]
 #[test]
 fn nocheck_order() {
     let scene = TestScenario::new(util_name!());
     let at = &scene.fixtures;
     at.write("bad_order_1", "e\nd\nb\na\n");
     at.write("bad_order_2", "e\nc\nb\na\n");
-    new_ucmd!()
+    scene
+        .ucmd()
         .args(&["--nocheck-order", "bad_order_1", "bad_order_2"])
         .succeeds()
-        .stdout_is("\t\te\n\tc\n\tb\n\ta\nd\nb\na\n");
+        .stdout_is("\t\te\n\tc\n\tb\n\ta\nd\nb\na\n")
+        .no_stderr();
 }
 
 // when neither --check-order nor --no-check-order is provided,
 // stderr and the error code behaves like check order, but stdout
 // behaves like nocheck_order. However with some quirks detailed below.
-#[ignore = "not implemented"]
 #[test]
 fn defaultcheck_order() {
     let scene = TestScenario::new(util_name!());
     let at = &scene.fixtures;
+    at.write("a", "a\n");
     at.write("bad_order_1", "e\nd\nb\na\n");
-    new_ucmd!()
+    scene
+        .ucmd()
         .args(&["a", "bad_order_1"])
         .fails()
-        .stderr_only("error to be defined");
+        .stdout_is("a\n\te\n\td\n\tb\n\ta\n")
+        .stderr_is(
+            "comm: file 2 is not in sorted order\n\
+             comm: input is not in sorted order\n",
+        );
 }
 
 // * the first: if both files are not in order, the default behavior is the only
@@ -451,9 +456,6 @@ fn test_is_dir() {
 
 #[test]
 fn test_sorted() {
-    let expected_stderr =
-        "comm: file 2 is not in sorted order\ncomm: input is not in sorted order\n";
-
     let scene = TestScenario::new(util_name!());
     let at = &scene.fixtures;
     at.write("comm1", "1\n3");
@@ -463,7 +465,7 @@ fn test_sorted() {
         .args(&["comm1", "comm2"])
         .fails_with_code(1)
         .stdout_is("1\n\t\t3\n\t2\n")
-        .stderr_is(expected_stderr);
+        .stderr_is("comm: file 2 is not in sorted order\ncomm: input is not in sorted order\n");
 }
 
 #[test]
@@ -650,6 +652,7 @@ fn test_comm_eintr_handling() {
 }
 
 #[test]
+#[cfg_attr(wasi_runner, ignore = "WASI: argv/filenames must be valid UTF-8")]
 fn test_output_lossy_utf8() {
     let scene = TestScenario::new(util_name!());
     let at = &scene.fixtures;
@@ -675,15 +678,15 @@ fn test_output_lossy_utf8() {
 
 #[test]
 #[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg_attr(wasi_runner, ignore = "WASI sandbox: host paths not visible")]
 fn test_comm_anonymous_pipes() {
     use std::{io::Write, os::fd::AsRawFd, process};
-    use uucore::pipes::pipe;
 
     let scene = TestScenario::new(util_name!());
 
     // Open two anonymous pipes
-    let (comm1_reader, mut comm1_writer) = pipe().unwrap();
-    let (comm2_reader, mut comm2_writer) = pipe().unwrap();
+    let (comm1_reader, mut comm1_writer) = std::io::pipe().unwrap();
+    let (comm2_reader, mut comm2_writer) = std::io::pipe().unwrap();
 
     // comm reads the data in chunks
     // make content large enough, so that at least two chunks are read
@@ -714,6 +717,7 @@ fn test_comm_anonymous_pipes() {
 
 #[test]
 #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+#[cfg_attr(wasi_runner, ignore = "WASI sandbox: host paths not visible")]
 fn test_read_error() {
     new_ucmd!()
         .arg("/proc/self/mem")
@@ -726,4 +730,19 @@ fn test_read_error() {
         .arg("/proc/self/mem")
         .fails()
         .stderr_contains("comm: /proc/self/mem: Input/output error");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_comm_write_error_dev_full() {
+    use std::fs::OpenOptions;
+    let scene = TestScenario::new(util_name!());
+    scene.fixtures.write("a", "a\n");
+    let dev_full = OpenOptions::new().write(true).open("/dev/full").unwrap();
+    scene
+        .ucmd()
+        .args(&["a", "a"])
+        .set_stdout(dev_full)
+        .fails()
+        .stderr_contains("No space left on device");
 }

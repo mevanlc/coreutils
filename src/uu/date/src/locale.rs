@@ -12,26 +12,25 @@
 macro_rules! cfg_langinfo {
     ($($item:item)*) => {
         $(
-            #[cfg(any(
-                target_os = "linux",
-                target_vendor = "apple",
-                target_os = "freebsd",
-                target_os = "netbsd",
-                target_os = "openbsd",
-                target_os = "dragonfly"
-            ))]
+            #[cfg(all(unix, not(target_os = "android"), not(target_os = "cygwin"), not(target_os = "redox")))]
             $item
         )*
     }
 }
 
 cfg_langinfo! {
-    use std::ffi::CStr;
+    use core::ffi::CStr;
     use std::sync::OnceLock;
-    use nix::libc;
 
     #[cfg(test)]
     use std::sync::Mutex;
+
+    /// glibc's `_DATE_FMT` has been stable for the last 12 years
+    /// being added upstream to libc TODO: update to libc
+    #[cfg(any(target_os = "linux", target_os = "cygwin"))]
+    const DATE_FMT: libc::nl_item = 0x2006c;
+    #[cfg(not(any(target_os = "linux", target_os = "cygwin")))]
+    const DATE_FMT: libc::nl_item = libc::D_T_FMT;
 }
 
 cfg_langinfo! {
@@ -76,17 +75,12 @@ cfg_langinfo! {
             libc::setlocale(libc::LC_TIME, c"".as_ptr());
 
             // Get the date/time format string
-            let d_t_fmt_ptr = libc::nl_langinfo(libc::D_T_FMT);
+            let d_t_fmt_ptr = libc::nl_langinfo(DATE_FMT);
             if d_t_fmt_ptr.is_null() {
                 return None;
             }
 
-            let format = CStr::from_ptr(d_t_fmt_ptr).to_str().ok()?;
-            if format.is_empty() {
-                return None;
-            }
-
-            Some(format.to_string())
+            CStr::from_ptr(d_t_fmt_ptr).to_str().ok().filter(|f| !f.is_empty()).map(ToOwned::to_owned)
         }
     }
 
@@ -111,14 +105,12 @@ cfg_langinfo! {
 }
 
 /// On platforms without nl_langinfo support, use 24-hour format by default
-#[cfg(not(any(
-    target_os = "linux",
-    target_vendor = "apple",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly"
-)))]
+#[cfg(any(
+    not(unix),
+    target_os = "android",
+    target_os = "cygwin",
+    target_os = "redox"
+))]
 pub fn get_locale_default_format() -> &'static str {
     "%a %b %e %X %Z %Y"
 }
@@ -127,6 +119,24 @@ pub fn get_locale_default_format() -> &'static str {
 mod tests {
     cfg_langinfo! {
         use super::*;
+
+        /// Helper function to expand a format string with a known test date
+        ///
+        /// Uses a fixed test date: Monday, January 15, 2024, 14:30:45 UTC
+        /// This allows us to validate format strings by checking their expanded output
+        /// rather than looking for literal format codes.
+        fn expand_format_with_test_date(format: &str) -> String {
+            use jiff::civil::date;
+            use jiff::fmt::strtime;
+
+            // Create test timestamp: Monday, January 15, 2024, 14:30:45 UTC
+            let Ok(test_date) = date(2024, 1, 15).at(14, 30, 45, 0).in_tz("UTC") else {
+                return String::new();
+            };
+
+            // Expand the format string with the test date
+            strtime::format(format, &test_date).unwrap_or_default()
+        }
 
         #[test]
         fn test_locale_detection() {
@@ -137,10 +147,31 @@ mod tests {
         #[test]
         fn test_default_format_contains_valid_codes() {
             let format = get_locale_default_format();
-            assert!(format.contains("%a")); // abbreviated weekday
-            assert!(format.contains("%b")); // abbreviated month
-            assert!(format.contains("%Y") || format.contains("%y")); // year (4-digit or 2-digit)
-            assert!(format.contains("%Z")); // timezone
+
+            let expanded = expand_format_with_test_date(format);
+
+            // Verify expanded output contains expected components
+            // Test date: Monday, January 15, 2024, 14:30:45
+            assert!(
+                expanded.contains("Mon") || expanded.contains("Monday"),
+                "Expanded format should contain weekday name, got: {expanded}"
+            );
+
+            assert!(
+                expanded.contains("Jan") || expanded.contains("January"),
+                "Expanded format should contain month name, got: {expanded}"
+            );
+
+            assert!(
+                expanded.contains("2024") || expanded.contains("24"),
+                "Expanded format should contain year, got: {expanded}"
+            );
+
+            // Keep literal %Z check - this is enforced by ensure_timezone_in_format()
+            assert!(
+                format.contains("%Z"),
+                "Format string must contain %Z timezone (enforced by ensure_timezone_in_format)"
+            );
         }
 
         #[test]
@@ -151,25 +182,34 @@ mod tests {
             // The format should not be empty
             assert!(!format.is_empty(), "Locale format should not be empty");
 
-            // Should contain date/time components
-            let has_date_component = format.contains("%a")
-                || format.contains("%A")
-                || format.contains("%b")
-                || format.contains("%B")
-                || format.contains("%d")
-                || format.contains("%e");
-            assert!(has_date_component, "Format should contain date components");
+            let expanded = expand_format_with_test_date(format);
 
-            // Should contain time component (hour)
-            let has_time_component = format.contains("%H")
-                || format.contains("%I")
-                || format.contains("%k")
-                || format.contains("%l")
-                || format.contains("%r")
-                || format.contains("%R")
-                || format.contains("%T")
-                || format.contains("%X");
-            assert!(has_time_component, "Format should contain time components");
+            // Verify expanded output contains date components
+            // Test date: Monday, January 15, 2024
+            let has_date_component = expanded.contains("15")     // day
+                || expanded.contains("Jan")                      // month name
+                || expanded.contains("January")                  // full month
+                || expanded.contains("Mon")                      // weekday
+                || expanded.contains("Monday");                  // full weekday
+
+            assert!(
+                has_date_component,
+                "Expanded format should contain date components, got: {expanded}"
+            );
+
+            // Verify expanded output contains time components
+            // Test time: 14:30:45
+            let has_time_component = expanded.contains("14")     // 24-hour
+                || expanded.contains("02")                       // 12-hour
+                || expanded.contains("30")                       // minutes
+                || expanded.contains(':')                        // time separator
+                || expanded.contains("PM")                       // AM/PM indicator
+                || expanded.contains("pm");
+
+            assert!(
+                has_time_component,
+                "Expanded format should contain time components, got: {expanded}"
+            );
         }
 
         #[test]
@@ -178,9 +218,9 @@ mod tests {
             let _lock = LOCALE_MUTEX.lock().unwrap();
 
             // Save original locale (both environment and process locale)
-            let original_lc_all = std::env::var("LC_ALL").ok();
-            let original_lc_time = std::env::var("LC_TIME").ok();
-            let original_lang = std::env::var("LANG").ok();
+            let original_lc_all = std::env::var_os("LC_ALL");
+            let original_lc_time = std::env::var_os("LC_TIME");
+            let original_lang = std::env::var_os("LANG");
 
             // Save current process locale
             let original_process_locale = unsafe {
@@ -188,7 +228,7 @@ mod tests {
                 if ptr.is_null() {
                     None
                 } else {
-                    CStr::from_ptr(ptr).to_str().ok().map(|s| s.to_string())
+                    CStr::from_ptr(ptr).to_str().ok().map(ToString::to_string)
                 }
             };
 

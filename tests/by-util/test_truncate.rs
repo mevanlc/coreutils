@@ -90,12 +90,6 @@ fn test_failed() {
 }
 
 #[test]
-fn test_failed_2() {
-    let (_at, mut ucmd) = at_and_ucmd!();
-    ucmd.args(&[FILE1]).fails();
-}
-
-#[test]
 fn test_failed_incorrect_arg() {
     let (_at, mut ucmd) = at_and_ucmd!();
     ucmd.args(&["-s", "+5A", FILE1]).fails();
@@ -174,6 +168,42 @@ fn test_round_up() {
 }
 
 #[test]
+fn test_round_up_file_smaller_than_size() {
+    let expected = 4096;
+    let (at, mut ucmd) = at_and_ucmd!();
+    let mut file = at.make_file(FILE2);
+    file.write_all(b"1234567890").unwrap();
+    ucmd.args(&["--size", "%4K", FILE2]).succeeds();
+    file.seek(SeekFrom::End(0)).unwrap();
+    let actual = file.stream_position().unwrap();
+    assert_eq!(expected, actual);
+}
+
+#[test]
+fn test_round_up_unaligned() {
+    let expected = 16;
+    let (at, mut ucmd) = at_and_ucmd!();
+    let mut file = at.make_file(FILE2);
+    file.write_all(b"1234567890123").unwrap();
+    ucmd.args(&["--size", "%8", FILE2]).succeeds();
+    file.seek(SeekFrom::End(0)).unwrap();
+    let actual = file.stream_position().unwrap();
+    assert_eq!(expected, actual);
+}
+
+#[test]
+fn test_round_up_already_aligned() {
+    let expected = 8;
+    let (at, mut ucmd) = at_and_ucmd!();
+    let mut file = at.make_file(FILE2);
+    file.write_all(b"12345678").unwrap();
+    ucmd.args(&["--size", "%4", FILE2]).succeeds();
+    file.seek(SeekFrom::End(0)).unwrap();
+    let actual = file.stream_position().unwrap();
+    assert_eq!(expected, actual);
+}
+
+#[test]
 fn test_size_and_reference() {
     let expected = 15;
     let (at, mut ucmd) = at_and_ucmd!();
@@ -218,6 +248,10 @@ fn test_invalid_numbers() {
         .args(&["-s", "0B", "file"])
         .fails()
         .stderr_contains("Invalid number: '0B'");
+    new_ucmd!()
+        .args(&["-s", "1b", "file"])
+        .fails()
+        .stderr_contains("Invalid number: '1b'");
 }
 
 #[test]
@@ -251,15 +285,24 @@ fn test_truncate_bytes_size() {
         .stderr_only("truncate: Invalid number: '1Y': Value too large for defined data type\n");
 }
 
+#[test]
+fn test_relative_size_overflow_preserves_file() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.write(FILE1, "x");
+
+    ucmd.args(&["--size=+18446744073709551615", FILE1])
+        .fails_with_code(1)
+        .stderr_contains("Value too large for defined data type");
+
+    assert_eq!(at.read(FILE1), "x");
+}
+
 /// Test that truncating a non-existent file creates that file.
 #[test]
 fn test_new_file() {
     let (at, mut ucmd) = at_and_ucmd!();
     let filename = "new_file_that_does_not_exist_yet";
-    ucmd.args(&["-s", "8", filename])
-        .succeeds()
-        .no_stdout()
-        .no_stderr();
+    ucmd.args(&["-s", "8", filename]).succeeds().no_output();
     assert!(at.file_exists(filename));
     assert_eq!(at.read_bytes(filename), vec![b'\0'; 8]);
 }
@@ -271,10 +314,7 @@ fn test_new_file_reference() {
     let mut old_file = at.make_file(FILE1);
     old_file.write_all(b"1234567890").unwrap();
     let filename = "new_file_that_does_not_exist_yet";
-    ucmd.args(&["-r", FILE1, filename])
-        .succeeds()
-        .no_stdout()
-        .no_stderr();
+    ucmd.args(&["-r", FILE1, filename]).succeeds().no_output();
     assert!(at.file_exists(filename));
     assert_eq!(at.read_bytes(filename), vec![b'\0'; 10]);
 }
@@ -288,8 +328,7 @@ fn test_new_file_size_and_reference() {
     let filename = "new_file_that_does_not_exist_yet";
     ucmd.args(&["-s", "+3", "-r", FILE1, filename])
         .succeeds()
-        .no_stdout()
-        .no_stderr();
+        .no_output();
     assert!(at.file_exists(filename));
     assert_eq!(at.read_bytes(filename), vec![b'\0'; 13]);
 }
@@ -301,8 +340,7 @@ fn test_new_file_no_create_size_only() {
     let filename = "new_file_that_does_not_exist_yet";
     ucmd.args(&["-s", "8", "-c", filename])
         .succeeds()
-        .no_stdout()
-        .no_stderr();
+        .no_output();
     assert!(!at.file_exists(filename));
 }
 
@@ -315,8 +353,7 @@ fn test_new_file_no_create_reference_only() {
     let filename = "new_file_that_does_not_exist_yet";
     ucmd.args(&["-r", FILE1, "-c", filename])
         .succeeds()
-        .no_stdout()
-        .no_stderr();
+        .no_output();
     assert!(!at.file_exists(filename));
 }
 
@@ -329,8 +366,7 @@ fn test_new_file_no_create_size_and_reference() {
     let filename = "new_file_that_does_not_exist_yet";
     ucmd.args(&["-r", FILE1, "-s", "+8", "-c", filename])
         .succeeds()
-        .no_stdout()
-        .no_stderr();
+        .no_output();
     assert!(!at.file_exists(filename));
 }
 
@@ -374,14 +410,24 @@ fn test_no_such_dir() {
         .stderr_contains("cannot open 'a/b' for writing: No such file or directory");
 }
 
+/// Test that truncate processes every file even if one fails.
+#[test]
+fn test_continue_after_error() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir("dir");
+    ucmd.args(&["-s", "0", "a", "dir", "b"])
+        .fails()
+        .no_stdout()
+        .stderr_contains("dir");
+    assert!(at.file_exists("a"));
+    assert!(at.file_exists("b"));
+}
+
 /// Test that truncate with a relative size less than 0 is not an error.
 #[test]
 fn test_underflow_relative_size() {
     let (at, mut ucmd) = at_and_ucmd!();
-    ucmd.args(&["-s-1", FILE1])
-        .succeeds()
-        .no_stdout()
-        .no_stderr();
+    ucmd.args(&["-s-1", FILE1]).succeeds().no_output();
     assert!(at.file_exists(FILE1));
     assert!(at.read_bytes(FILE1).is_empty());
 }
@@ -389,16 +435,14 @@ fn test_underflow_relative_size() {
 #[test]
 fn test_negative_size_with_space() {
     let (at, mut ucmd) = at_and_ucmd!();
-    ucmd.args(&["-s", "-1", FILE1])
-        .succeeds()
-        .no_stdout()
-        .no_stderr();
+    ucmd.args(&["-s", "-1", FILE1]).succeeds().no_output();
     assert!(at.file_exists(FILE1));
     assert!(at.read_bytes(FILE1).is_empty());
 }
 
 #[cfg(not(windows))]
 #[test]
+#[cfg_attr(wasi_runner, ignore = "WASI: no FIFO/mkfifo support")]
 fn test_fifo_error_size_only() {
     let (at, mut ucmd) = at_and_ucmd!();
     at.mkfifo("fifo");
@@ -410,6 +454,7 @@ fn test_fifo_error_size_only() {
 
 #[cfg(not(windows))]
 #[test]
+#[cfg_attr(wasi_runner, ignore = "WASI: no FIFO/mkfifo support")]
 fn test_fifo_error_reference_file_only() {
     let (at, mut ucmd) = at_and_ucmd!();
     at.mkfifo("fifo");
@@ -422,6 +467,7 @@ fn test_fifo_error_reference_file_only() {
 
 #[cfg(not(windows))]
 #[test]
+#[cfg_attr(wasi_runner, ignore = "WASI: no FIFO/mkfifo support")]
 fn test_fifo_error_reference_and_size() {
     let (at, mut ucmd) = at_and_ucmd!();
     at.mkfifo("fifo");
@@ -434,6 +480,7 @@ fn test_fifo_error_reference_and_size() {
 
 #[test]
 #[cfg(target_os = "linux")]
+#[cfg_attr(wasi_runner, ignore = "WASI: argv/filenames must be valid UTF-8")]
 fn test_truncate_non_utf8_paths() {
     use std::os::unix::ffi::OsStrExt;
     let ts = TestScenario::new(util_name!());
@@ -443,4 +490,53 @@ fn test_truncate_non_utf8_paths() {
 
     // Test that truncate can handle non-UTF-8 filenames
     ts.ucmd().arg("-s").arg("10").arg(file_name).succeeds();
+}
+
+#[test]
+fn test_empty_size() {
+    new_ucmd!()
+        .args(&["-s", "", "asd"])
+        .fails()
+        .stderr_is("truncate: Invalid number: ''\n");
+}
+
+#[test]
+fn test_sign_as_a_size() {
+    new_ucmd!()
+        .args(&["-s", "+", "asd"])
+        .fails()
+        .stderr_is("truncate: Invalid number: '+'\n");
+}
+
+#[cfg(unix)]
+#[cfg(all(feature = "feat_diagnostics", not(wasi_runner)))]
+mod diagnostics {
+    use super::*;
+
+    #[test]
+    fn test_snippet_counts_the_mode_character_before_the_size() {
+        let (at, mut ucmd) = at_and_ucmd!();
+        at.touch("probe");
+
+        let result = ucmd
+            .terminal_sim_stderr()
+            .args(&["--size=+2Zx", "probe"])
+            .fails_with_code(1);
+        let stderr = result.stderr_as_displayed();
+
+        // The `+` is part of the operand but not of the size, so the caret has
+        // to count it back in to land on the unit.
+        assert!(stderr.contains("truncate:1:19"), "{stderr}");
+        assert!(stderr.contains("not a known unit"), "{stderr}");
+    }
+
+    #[test]
+    fn test_plain_message_when_stderr_is_a_pipe() {
+        let (at, mut ucmd) = at_and_ucmd!();
+        at.touch("probe");
+
+        ucmd.args(&["-s", "10fb", "probe"])
+            .fails_with_code(1)
+            .stderr_contains("Invalid number: '10fb'");
+    }
 }

@@ -7,19 +7,18 @@
 
 use std::cmp;
 use std::cmp::PartialEq;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write, stdin, stdout};
-use std::num::ParseIntError;
 use std::path::Path;
 
-use clap::{Arg, ArgAction, Command};
+use clap::{Arg, ArgAction, Command, value_parser};
 use regex::Regex;
-use thiserror::Error;
+use rustc_hash::FxHashSet;
 use uucore::display::Quotable;
-use uucore::error::{FromIo, UError, UResult, USimpleError, UUsageError};
+use uucore::error::{FromIo, UResult, USimpleError, UUsageError};
 use uucore::format_usage;
 use uucore::translate;
 
@@ -68,7 +67,7 @@ impl Default for Config {
 fn read_word_filter_file(
     matches: &clap::ArgMatches,
     option: &str,
-) -> std::io::Result<HashSet<String>> {
+) -> std::io::Result<FxHashSet<String>> {
     let filename = matches
         .get_one::<OsString>(option)
         .expect("parsing options failed!");
@@ -78,7 +77,7 @@ fn read_word_filter_file(
         let file = File::open(Path::new(filename))?;
         Box::new(file)
     });
-    let mut words: HashSet<String> = HashSet::new();
+    let mut words: FxHashSet<String> = FxHashSet::default();
     for word in reader.lines() {
         words.insert(word?);
     }
@@ -89,7 +88,7 @@ fn read_word_filter_file(
 fn read_char_filter_file(
     matches: &clap::ArgMatches,
     option: &str,
-) -> std::io::Result<HashSet<char>> {
+) -> std::io::Result<FxHashSet<char>> {
     let filename = matches
         .get_one::<OsString>(option)
         .expect("parsing options failed!");
@@ -108,29 +107,29 @@ fn read_char_filter_file(
 struct WordFilter {
     only_specified: bool,
     ignore_specified: bool,
-    only_set: HashSet<String>,
-    ignore_set: HashSet<String>,
+    only_set: FxHashSet<String>,
+    ignore_set: FxHashSet<String>,
     word_regex: String,
 }
 
 impl WordFilter {
     #[allow(clippy::cognitive_complexity)]
     fn new(matches: &clap::ArgMatches, config: &Config) -> UResult<Self> {
-        let (o, oset): (bool, HashSet<String>) = if matches.contains_id(options::ONLY_FILE) {
+        let (o, oset): (bool, FxHashSet<String>) = if matches.contains_id(options::ONLY_FILE) {
             let words =
                 read_word_filter_file(matches, options::ONLY_FILE).map_err_context(String::new)?;
             (true, words)
         } else {
-            (false, HashSet::new())
+            (false, FxHashSet::default())
         };
-        let (i, iset): (bool, HashSet<String>) = if matches.contains_id(options::IGNORE_FILE) {
+        let (i, iset): (bool, FxHashSet<String>) = if matches.contains_id(options::IGNORE_FILE) {
             let words = read_word_filter_file(matches, options::IGNORE_FILE)
                 .map_err_context(String::new)?;
             (true, words)
         } else {
-            (false, HashSet::new())
+            (false, FxHashSet::default())
         };
-        let break_set: Option<HashSet<char>> = if matches.contains_id(options::BREAK_FILE)
+        let break_set: Option<FxHashSet<char>> = if matches.contains_id(options::BREAK_FILE)
             && !matches.contains_id(options::WORD_REGEXP)
         {
             let mut chars =
@@ -147,16 +146,10 @@ impl WordFilter {
         };
         // Ignore empty string regex from cmd-line-args
         let arg_reg: Option<String> = if matches.contains_id(options::WORD_REGEXP) {
-            match matches.get_one::<String>(options::WORD_REGEXP) {
-                Some(v) => {
-                    if v.is_empty() {
-                        None
-                    } else {
-                        Some(v.to_owned())
-                    }
-                }
-                None => None,
-            }
+            matches
+                .get_one::<String>(options::WORD_REGEXP)
+                .filter(|v| !v.is_empty())
+                .map(ToOwned::to_owned)
         } else {
             None
         };
@@ -195,14 +188,6 @@ struct WordRef {
     filename: OsString,
 }
 
-#[derive(Debug, Error)]
-enum PtxError {
-    #[error("{0}")]
-    ParseError(ParseIntError),
-}
-
-impl UError for PtxError {}
-
 fn get_config(matches: &mut clap::ArgMatches) -> UResult<Config> {
     let mut config = Config::default();
     let err_msg = "parsing options failed";
@@ -217,10 +202,14 @@ fn get_config(matches: &mut clap::ArgMatches) -> UResult<Config> {
         // In the future, we might want to switch to the onig crate (like expr does) for better compatibility.
 
         // Verify regex is valid and doesn't match empty string
-        if let Ok(re) = Regex::new(&regex) {
-            if re.is_match("") {
-                return Err(USimpleError::new(1, translate!("ptx-error-empty-regexp")));
-            }
+        let re = Regex::new(&regex).map_err(|error| {
+            USimpleError::new(
+                1,
+                translate!("ptx-error-invalid-regexp", "error" => error.to_string()),
+            )
+        })?;
+        if re.is_match("") {
+            return Err(USimpleError::new(1, translate!("ptx-error-empty-regexp")));
         }
 
         config.sentence_regex = Some(regex);
@@ -242,18 +231,12 @@ fn get_config(matches: &mut clap::ArgMatches) -> UResult<Config> {
             .clone_into(&mut config.trunc_str);
     }
     if matches.contains_id(options::WIDTH) {
-        config.line_width = matches
-            .get_one::<String>(options::WIDTH)
-            .expect(err_msg)
-            .parse()
-            .map_err(PtxError::ParseError)?;
+        config.line_width = *matches.get_one::<u64>(options::WIDTH).unwrap() as usize;
+    } else if matches.get_flag(options::TYPESET_MODE) {
+        config.line_width = 100;
     }
     if matches.contains_id(options::GAP_SIZE) {
-        config.gap_size = matches
-            .get_one::<String>(options::GAP_SIZE)
-            .expect(err_msg)
-            .parse()
-            .map_err(PtxError::ParseError)?;
+        config.gap_size = *matches.get_one::<u64>(options::GAP_SIZE).unwrap() as usize;
     }
     if let Some(format) = matches.get_one::<String>(options::FORMAT) {
         config.format = match format.as_str() {
@@ -279,7 +262,7 @@ struct FileContent {
 
 type FileMap = Vec<(OsString, FileContent)>;
 
-fn read_input(input_files: &[OsString], config: &Config) -> std::io::Result<FileMap> {
+fn read_input(input_files: &[OsString], config: &Config) -> UResult<FileMap> {
     let mut file_map: FileMap = FileMap::new();
     let mut offset: usize = 0;
 
@@ -292,11 +275,15 @@ fn read_input(input_files: &[OsString], config: &Config) -> std::io::Result<File
         let mut reader: BufReader<Box<dyn Read>> = BufReader::new(if filename == "-" {
             Box::new(stdin())
         } else {
-            let file = File::open(Path::new(filename))?;
+            // Attach the quoted filename to the error context if opening fails
+            let file =
+                File::open(Path::new(filename)).map_err_context(|| filename.quote().to_string())?;
             Box::new(file)
         });
 
-        let lines = read_lines(sentence_splitter.as_ref(), &mut reader)?;
+        // Attach the quoted filename context if reading the contents fails
+        let lines = read_lines(sentence_splitter.as_ref(), &mut reader)
+            .map_err_context(|| filename.quote().to_string())?;
 
         // Indexing UTF-8 string requires walking from the beginning, which can hurts performance badly when the line is long.
         // Since we will be jumping around the line a lot, we dump the content into a Vec<char>, which can be indexed in constant time.
@@ -354,7 +341,19 @@ fn create_word_set(config: &Config, filter: &WordFilter, file_map: &FileMap) -> 
             };
             // match words with given regex
             for mat in reg.find_iter(line) {
-                let (beg, end) = (mat.start(), mat.end());
+                let (mut beg, end) = (mat.start(), mat.end());
+
+                // GNU-compatible default behavior:
+                // with default regexp, keyword must start at first alphabetic char.
+                if filter.word_regex == Config::default().context_regex {
+                    let matched = &line[beg..end];
+                    if let Some(pos) = matched.find(|c: char| c.is_alphabetic()) {
+                        beg += pos;
+                    } else {
+                        continue;
+                    }
+                }
+
                 if config.input_ref && ((beg, end) == (ref_beg, ref_end)) {
                     continue;
                 }
@@ -457,11 +456,11 @@ fn get_output_chunks(
     // https://github.com/MaiZure/coreutils-8.3/blob/master/src/ptx.c#L1234
     let half_line_size = config.line_width / 2;
     let max_before_size = cmp::max(half_line_size as isize - config.gap_size as isize, 0) as usize;
+
+    let keyword_len = keyword.chars().count();
+    let trunc_len = config.trunc_str.chars().count();
     let max_after_size = cmp::max(
-        half_line_size as isize
-            - (2 * config.trunc_str.len()) as isize
-            - keyword.len() as isize
-            - 1,
+        half_line_size as isize - (2 * trunc_len) as isize - keyword_len as isize - 1,
         0,
     ) as usize;
 
@@ -487,7 +486,7 @@ fn get_output_chunks(
     // and get the string.
     let before_str: String = all_before[before_beg..before_end].iter().collect();
     before.push_str(&before_str);
-    assert!(max_before_size >= before.len());
+    assert!(max_before_size >= before.chars().count());
 
     // the after chunk
 
@@ -502,13 +501,13 @@ fn get_output_chunks(
     // and get the string
     let after_str: String = all_after[0..after_end].iter().collect();
     after.push_str(&after_str);
-    assert!(max_after_size >= after.len());
+    assert!(max_after_size >= after.chars().count());
 
     // the tail chunk
 
     // max size of the tail chunk = max size of left half - space taken by before chunk - gap size.
     let max_tail_size = cmp::max(
-        max_before_size as isize - before.len() as isize - config.gap_size as isize,
+        max_before_size as isize - before.chars().count() as isize - config.gap_size as isize,
         0,
     ) as usize;
 
@@ -580,19 +579,25 @@ fn get_output_chunks(
     (tail, before, after, head)
 }
 
-fn tex_mapper(x: char) -> String {
-    match x {
-        '\\' => "\\backslash{}".to_owned(),
-        '$' | '%' | '#' | '&' | '_' => format!("\\{x}"),
-        '}' | '{' => format!("$\\{x}$"),
-        _ => x.to_string(),
-    }
-}
-
 /// Escape special characters for TeX.
 fn format_tex_field(s: &str) -> String {
-    let mapped_chunks: Vec<String> = s.chars().map(tex_mapper).collect();
-    mapped_chunks.join("")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\backslash{}"),
+            '$' | '%' | '#' | '&' | '_' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '}' | '{' => {
+                out.push_str("$\\");
+                out.push(c);
+                out.push('$');
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn format_tex_line(
@@ -894,6 +899,7 @@ mod options {
     pub static IGNORE_FILE: &str = "ignore-file";
     pub static ONLY_FILE: &str = "only-file";
     pub static REFERENCES: &str = "references";
+    pub static TYPESET_MODE: &str = "typeset-mode";
     pub static WIDTH: &str = "width";
 }
 
@@ -932,16 +938,16 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     }
 
     let word_filter = WordFilter::new(&matches, &config)?;
-    let file_map = read_input(&input_files, &config).map_err_context(String::new)?;
+    let file_map = read_input(&input_files, &config)?;
     let word_set = create_word_set(&config, &word_filter, &file_map);
     write_traditional_output(&mut config, &file_map, &word_set, &output_file)
 }
 
 pub fn uu_app() -> Command {
-    Command::new(uucore::util_name())
+    Command::new("ptx")
         .about(translate!("ptx-about"))
         .version(uucore::crate_version!())
-        .help_template(uucore::localized_help_template(uucore::util_name()))
+        .help_template(uucore::localized_help_template("ptx"))
         .override_usage(format_usage(&translate!("ptx-usage")))
         .infer_long_args(true)
         .arg(
@@ -1041,6 +1047,7 @@ pub fn uu_app() -> Command {
             Arg::new(options::GAP_SIZE)
                 .short('g')
                 .long(options::GAP_SIZE)
+                .value_parser(value_parser!(u64).range(1..))
                 .help(translate!("ptx-help-gap-size"))
                 .value_name("NUMBER"),
         )
@@ -1071,9 +1078,17 @@ pub fn uu_app() -> Command {
                 .action(ArgAction::SetTrue),
         )
         .arg(
+            Arg::new(options::TYPESET_MODE)
+                .short('t')
+                .long(options::TYPESET_MODE)
+                .help(translate!("ptx-help-typeset-mode"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
             Arg::new(options::WIDTH)
                 .short('w')
                 .long(options::WIDTH)
+                .value_parser(value_parser!(u64).range(1..))
                 .help(translate!("ptx-help-width"))
                 .value_name("NUMBER"),
         )

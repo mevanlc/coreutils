@@ -3,7 +3,6 @@ name = "uu_chmod"
 description = "chmod ~ (uutils) change mode of FILE"
 repository = "https://github.com/uutils/coreutils/tree/main/src/uu/chmod"
 version.workspace = true
-authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 keywords.workspace = true
@@ -12,11 +11,9 @@ edition.workspace = true
 rust-version.workspace = true
 readme.workspace = true
 
-[lints]
-workspace = true
-
 [lib]
 path = "src/chmod.rs"
+doctest = false
 
 [dependencies]
 clap = { workspace = true }
@@ -26,6 +23,12 @@ fluent = { workspace = true }
 
 [target.'cfg(all(unix, not(target_os = "redox")))'.dependencies]
 uucore = { workspace = true, features = ["safe-traversal"] }
+
+[features]
+diagnostics = ["uucore/diagnostics"]
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "chmod"

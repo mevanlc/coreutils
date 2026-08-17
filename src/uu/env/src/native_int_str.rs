@@ -13,8 +13,10 @@
 // this conversion needs to be done only once in the beginning and at the end.
 
 use std::ffi::OsString;
-#[cfg(not(target_os = "windows"))]
+#[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(target_os = "wasi")]
+use std::os::wasi::ffi::{OsStrExt, OsStringExt};
 #[cfg(target_os = "windows")]
 use std::os::windows::prelude::*;
 use std::{borrow::Cow, ffi::OsStr};
@@ -257,7 +259,7 @@ impl<'a> NativeStr<'a> {
         let n_prefix = to_native_int_representation(prefix);
         let result = self.match_cow(
             |b| b.strip_prefix(&*n_prefix).ok_or(()),
-            |o| o.strip_prefix(&*n_prefix).map(|x| x.to_vec()).ok_or(()),
+            |o| o.strip_prefix(&*n_prefix).map(ToOwned::to_owned).ok_or(()),
         );
         result.ok()
     }
@@ -266,7 +268,7 @@ impl<'a> NativeStr<'a> {
         let n_prefix = to_native_int_representation(prefix);
         let result = self.match_cow_native(
             |b| b.strip_prefix(&*n_prefix).ok_or(()),
-            |o| o.strip_prefix(&*n_prefix).map(|x| x.to_vec()).ok_or(()),
+            |o| o.strip_prefix(&*n_prefix).map(ToOwned::to_owned).ok_or(()),
         );
         result.ok()
     }

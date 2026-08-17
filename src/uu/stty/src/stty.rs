@@ -21,7 +21,11 @@ use crate::flags::COMBINATION_SETTINGS;
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use nix::libc::{O_NONBLOCK, TIOCGWINSZ, TIOCSWINSZ, c_ushort};
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    not(target_arch = "powerpc"),
+    not(target_arch = "powerpc64")
+))]
 use nix::libc::{TCGETS2, termios2};
 
 use nix::sys::termios::{
@@ -212,7 +216,7 @@ impl<'a> Options<'a> {
             device_name,
             settings: matches
                 .get_many::<String>(options::SETTINGS)
-                .map(|v| v.map(|s| s.as_ref()).collect()),
+                .map(|v| v.map(AsRef::as_ref).collect()),
         })
     }
 }
@@ -627,19 +631,45 @@ fn print_terminal_size(
     #[cfg(not(target_os = "linux"))]
     let speed = nix::sys::termios::cfgetospeed(termios);
     #[cfg(target_os = "linux")]
+    #[cfg(all(not(target_arch = "powerpc"), not(target_arch = "powerpc64")))]
     ioctl_read_bad!(tcgets2, TCGETS2, termios2);
     #[cfg(target_os = "linux")]
+    #[cfg(all(not(target_arch = "powerpc"), not(target_arch = "powerpc64")))]
     let speed = {
         let mut t2 = unsafe { std::mem::zeroed::<termios2>() };
         unsafe { tcgets2(opts.file.as_raw_fd(), &raw mut t2)? };
         t2.c_ospeed
     };
+    #[cfg(target_os = "linux")]
+    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+    let speed = nix::sys::termios::cfgetospeed(termios);
 
     let mut printer = WrappedPrinter::new(window_size);
 
-    // BSDs and Linux use a u32 for the baud rate, so we can simply print it.
+    // BSDs and Linux (not ppc/big-endian ppc64) use a u32 for the baud rate, so we can simply
+    // print it.
     #[cfg(any(target_os = "linux", bsd))]
+    #[cfg(all(
+        not(target_arch = "powerpc"),
+        not(all(target_arch = "powerpc64", target_endian = "big"))
+    ))]
     printer.print(&translate!("stty-output-speed", "speed" => speed));
+
+    // Big-endian Linux PowerPC uses BaudRate enum, need to convert to display format
+    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_arch = "powerpc",
+        all(target_arch = "powerpc64", target_endian = "big")
+    ))]
+    {
+        // On PowerPC, find the corresponding baud rate string for display
+        let speed_str = BAUD_RATES
+            .iter()
+            .find(|(_, rate)| *rate == speed)
+            .map(|(text, _)| *text)
+            .unwrap_or("unknown");
+        printer.print(&translate!("stty-output-speed", "speed" => speed_str));
+    }
 
     // Other platforms need to use the baud rate enum, so printing the right value
     // becomes slightly more complicated.
@@ -713,19 +743,19 @@ fn parse_baud_with_rounding(normalized: &str) -> Option<u32> {
 
         // Validate all remaining chars are digits
         let rest: Vec<_> = chars.collect();
-        if !rest.iter().all(|c| c.is_ascii_digit()) {
+        if !rest.iter().all(char::is_ascii_digit) {
             return None;
         }
 
         match first_digit.cmp(&5) {
-            Ordering::Greater => value += 1,
+            Ordering::Greater => value = value.checked_add(1)?,
             Ordering::Equal => {
                 // Check if any non-zero digit follows
                 if rest.iter().any(|&c| c != '0') {
-                    value += 1;
+                    value = value.checked_add(1)?;
                 } else {
                     // Banker's rounding: round to nearest even
-                    value += value & 1;
+                    value = value.checked_add(value & 1)?;
                 }
             }
             Ordering::Less => {} // Round down, already validated
@@ -1090,6 +1120,7 @@ fn string_to_control_char(s: &str) -> Result<u8, ControlCharMappingError> {
 fn combo_to_flags(combo: &str) -> Vec<ArgOptions<'_>> {
     let mut flags = Vec::new();
     let mut ccs = Vec::new();
+    #[expect(clippy::match_same_arms)]
     match combo {
         "lcase" | "LCASE" => {
             flags = vec!["xcase", "iuclc", "olcuc"];
@@ -1190,6 +1221,12 @@ fn combo_to_flags(combo: &str) -> Vec<ArgOptions<'_>> {
                 (S::VDISCARD, "^O"),
             ];
         }
+        "tabs" => {
+            flags = vec!["tab0"];
+        }
+        "-tabs" => {
+            flags = vec!["tab3"];
+        }
         _ => unreachable!("invalid combination setting: must have been caught earlier"),
     }
     let mut flags = flags
@@ -1223,9 +1260,9 @@ fn get_sane_control_char(cc_index: S) -> u8 {
 }
 
 pub fn uu_app() -> Command {
-    Command::new(uucore::util_name())
+    Command::new("stty")
         .version(uucore::crate_version!())
-        .help_template(uucore::localized_help_template(uucore::util_name()))
+        .help_template(uucore::localized_help_template("stty"))
         .override_usage(format_usage(&translate!("stty-usage")))
         .about(translate!("stty-about"))
         .infer_long_args(true)
@@ -1450,6 +1487,14 @@ mod tests {
             assert_eq!(string_to_baud("", flags::BaudType::Both), None);
             assert_eq!(string_to_baud("abc", flags::BaudType::Both), None);
         }
+    }
+
+    #[test]
+    fn test_parse_baud_with_rounding_rejects_u32_overflow() {
+        assert_eq!(parse_baud_with_rounding("4294967295.4"), Some(u32::MAX));
+        assert_eq!(parse_baud_with_rounding("4294967295.6"), None);
+        assert_eq!(parse_baud_with_rounding("4294967295.5"), None);
+        assert_eq!(parse_baud_with_rounding("4294967295.5001"), None);
     }
 
     // Tests for string_to_combo

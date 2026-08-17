@@ -1,12 +1,13 @@
 name: Benchmarks
 
-# spell-checker:ignore codspeed dtolnay Swatinem sccache
+# spell-checker:ignore (people) taiki-e
+# spell-checker:ignore (misc) codspeed sccache
 
 on:
   pull_request:
   push:
     branches:
-      - '*'
+      - main
 
 permissions:
   contents: read # to fetch code (actions/checkout)
@@ -20,23 +21,29 @@ jobs:
   benchmarks:
     name: Run ${{ matrix.type }} benchmarks for ${{ matrix.package }} (CodSpeed)
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     env:
-      RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: 0
-      SCCACHE_GHA_ENABLED: "true"
     strategy:
+      # Stagger the jobs: 70 concurrent runners hitting the GitHub cache API
+      # (rust-cache + sccache + CodSpeed) at once triggers HTTP 429s.
+      max-parallel: 12
       matrix:
         type: [simulation, memory]
         package: [
           uu_base64,
           uu_cksum,
           uu_cp,
+          uu_cat,
           uu_cut,
           uu_dd,
           uu_df,
           uu_du,
+          uu_echo,
           uu_expand,
+          uu_expr,
           uu_fold,
+          uu_hostname,
           uu_join,
           uu_ls,
           uu_mv,
@@ -47,15 +54,22 @@ jobs:
           uu_shuf,
           uu_sort,
           uu_split,
+          uu_tee,
+          uu_timeout,
+          uu_tr,
           uu_tsort,
           uu_unexpand,
           uu_uniq,
           uu_wc,
           uu_factor,
-          uu_date
+          uu_date,
+          uu_csplit,
+          uu_true,
+          uu_false,
+          uu_ptx
         ]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
@@ -64,19 +78,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        id: sccache-setup
+        uses: mozilla-actions/sccache-action@v0.0.11
+        continue-on-error: true
+      - name: Export sccache
+        if: steps.sccache-setup.outcome == 'success'
+        run: |
+          echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+          echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
 
       - name: Install locales
         shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y locales
           sudo locale-gen fr_FR.UTF-8
           sudo update-locale
 
-      - name: Install cargo-codspeed
-        shell: bash
-        run: cargo install cargo-codspeed --locked
+      - name: Install tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-codspeed
 
       - name: Build benchmarks for ${{ matrix.package }} (${{ matrix.type }})
         shell: bash
@@ -85,7 +105,7 @@ jobs:
           cargo codspeed build -m ${{ matrix.type }} -p ${{ matrix.package }}
 
       - name: Run ${{ matrix.type }} benchmarks for ${{ matrix.package }}
-        uses: CodSpeedHQ/action@v4
+        uses: CodSpeedHQ/action@v5
         env:
           CODSPEED_LOG: debug
         with:

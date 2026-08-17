@@ -4,10 +4,12 @@
 // file that was distributed with this source code.
 //
 // spell-checker:ignore binvalid finvalid hinvalid iinvalid linvalid nabcabc nabcabcabc ninvalid vinvalid winvalid dabc näää févr
+
 use uutests::{at_and_ucmd, new_ucmd, util::TestScenario, util_name};
 
 #[test]
 #[cfg(target_os = "linux")]
+#[cfg_attr(wasi_runner, ignore = "WASI: argv/filenames must be valid UTF-8")]
 fn test_non_utf8_paths() {
     use std::os::unix::ffi::OsStringExt;
     let (at, mut ucmd) = at_and_ucmd!();
@@ -207,7 +209,8 @@ fn test_number_separator() {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
+#[cfg_attr(wasi_runner, ignore = "WASI: argv/filenames must be valid UTF-8")]
 fn test_number_separator_non_utf8() {
     use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
@@ -410,6 +413,19 @@ fn test_default_body_numbering_multiple_files_and_stdin() {
         .pipe_in("b")
         .succeeds()
         .stdout_is("     1\ta\n     2\tb\n     3\tc\n");
+}
+
+#[test]
+fn test_default_body_numbering_multiple_files_with_non_existing_file() {
+    let (at, mut ucmd) = at_and_ucmd!();
+
+    at.write("a.txt", "a");
+    at.write("b.txt", "b");
+
+    ucmd.args(&["a.txt", "non_existing", "b.txt"])
+        .fails_with_code(1)
+        .stdout_is("     1\ta\n     2\tb\n")
+        .stderr_is("nl: non_existing: No such file or directory\n");
 }
 
 #[test]
@@ -628,7 +644,8 @@ fn test_section_delimiter() {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
+#[cfg_attr(wasi_runner, ignore = "WASI: argv/filenames must be valid UTF-8")]
 fn test_section_delimiter_non_utf8() {
     use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
@@ -694,7 +711,8 @@ fn test_one_char_section_delimiter() {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
+#[cfg_attr(wasi_runner, ignore = "WASI: argv/filenames must be valid UTF-8")]
 fn test_one_byte_section_delimiter() {
     use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
@@ -736,23 +754,23 @@ fn test_one_byte_section_delimiter() {
 }
 
 #[test]
-fn test_non_ascii_one_char_section_delimiter() {
+fn test_multi_byte_one_char_section_delimiter() {
     for arg in ["-dä", "--section-delimiter=ä"] {
         new_ucmd!()
             .arg(arg)
-            .pipe_in("a\näää\nb") // header section
+            .pipe_in("a\nä:ä:ä:\nb") // header section
             .succeeds()
             .stdout_is("     1\ta\n\n       b\n");
 
         new_ucmd!()
             .arg(arg)
-            .pipe_in("a\nää\nb") // body section
+            .pipe_in("a\nä:ä:\nb") // body section
             .succeeds()
             .stdout_is("     1\ta\n\n     1\tb\n");
 
         new_ucmd!()
             .arg(arg)
-            .pipe_in("a\nä\nb") // footer section
+            .pipe_in("a\nä:\nb") // footer section
             .succeeds()
             .stdout_is("     1\ta\n\n       b\n");
     }
@@ -911,4 +929,14 @@ fn test_repeated_section_delimiter_flag() {
         .pipe_in("|:|:|:\na\nb\nc")
         .succeeds()
         .stdout_is("\n       a\n       b\n       c\n");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_no_skip_after_error() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.write("f", "hello");
+    ucmd.args(&["/proc/self/mem", "f"])
+        .fails()
+        .stdout_is("     1\thello\n");
 }

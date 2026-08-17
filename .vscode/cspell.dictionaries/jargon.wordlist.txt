@@ -26,6 +26,7 @@ conv
 cyclomatic
 dedup
 deduplication
+dired
 demangle
 denoland
 deque
@@ -33,6 +34,7 @@ dequeue
 dev
 EINTR
 eintr
+ELOOP
 nextest
 SIGUSR
 nonprinting
@@ -42,6 +44,7 @@ discoverability
 duplicative
 dsync
 endianness
+endgroup
 enqueue
 ERANGE
 errored
@@ -116,6 +119,7 @@ noxfer
 ofile
 oflag
 oflags
+openat
 pdeathsig
 peekable
 performant
@@ -134,6 +138,7 @@ ROOTFS
 reparse
 rposition
 seedable
+seekable
 semver
 semiprime
 semiprimes
@@ -157,6 +162,8 @@ SIGTTOU
 sigttou
 sigusr
 strcasecmp
+strtime
+strcoll
 subcommand
 subexpression
 submodule
@@ -180,11 +187,14 @@ unintuitive
 unprefixed
 unportable
 unsync
+unwritable
 urand
+utimensat
 whitespace
 wordlist
 wordlists
 xattrs
+xffb
 xpass
 
 # * abbreviations
@@ -214,6 +224,13 @@ vals
 inval
 nofield
 
+# ci
+dtolnay
+Swatinem
+
+preopened
+dotdot
+
 # * clippy
 uninlined
 nonminimal
@@ -242,3 +259,5 @@ Hijri
 Nowruz
 charmap
 hijri
+ctype
+clocale

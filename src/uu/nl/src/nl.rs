@@ -254,9 +254,16 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
                 );
                 set_exit_code(1);
             } else {
-                let reader = File::open(path).map_err_context(|| file.maybe_quote().to_string())?;
-                let mut buffer = BufReader::new(reader);
-                nl(&mut buffer, &mut stats, &settings)?;
+                match File::open(path) {
+                    Ok(reader) => {
+                        let mut buffer = BufReader::new(reader);
+                        nl(&mut buffer, &mut stats, &settings)?;
+                    }
+                    Err(e) => {
+                        show_error!("{}", e.map_err_context(|| file.maybe_quote().to_string()));
+                        set_exit_code(1);
+                    }
+                }
             }
         }
     }
@@ -265,7 +272,7 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
 }
 
 pub fn uu_app() -> Command {
-    Command::new(uucore::util_name())
+    Command::new("nl")
         .about(translate!("nl-about"))
         .version(uucore::crate_version!())
         .help_template(uucore::localized_help_template(uucore::util_name()))
@@ -384,20 +391,26 @@ fn nl<T: Read>(reader: &mut BufReader<T>, stats: &mut Stats, settings: &Settings
     let mut writer = BufWriter::new(stdout());
     let mut current_numbering_style = &settings.body_numbering;
     let mut line = Vec::new();
+    // Written before every unnumbered line; hoisted so it is not reallocated per line.
+    let blank_prefix = vec![b' '; settings.number_width + 1];
 
     loop {
         line.clear();
         // reads up to and including b'\n'; returns 0 on EOF
-        let n = reader
-            .read_until(b'\n', &mut line)
-            .map_err_context(|| translate!("nl-error-could-not-read-line"))?;
-        if n == 0 {
-            break;
-        }
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(bytes_read) => bytes_read,
+            Err(err) => {
+                show_error!(
+                    "{}",
+                    err.map_err_context(|| translate!("nl-error-could-not-read-line"))
+                );
+                set_exit_code(1);
+                break;
+            }
+        };
 
-        if line.last().copied() == Some(b'\n') {
-            line.pop();
-        }
+        let _ = line.pop_if(|byte| *byte == b'\n');
 
         if line.is_empty() {
             stats.consecutive_empty_lines += 1;
@@ -439,12 +452,9 @@ fn nl<T: Read>(reader: &mut BufReader<T>, stats: &mut Stats, settings: &Settings
             };
 
             if is_line_numbered {
-                let Some(line_number) = stats.line_number else {
-                    return Err(USimpleError::new(
-                        1,
-                        translate!("nl-error-line-number-overflow"),
-                    ));
-                };
+                let line_number = stats.line_number.ok_or_else(|| {
+                    USimpleError::new(1, translate!("nl-error-line-number-overflow"))
+                })?;
                 settings
                     .number_format
                     .format_to(&mut writer, line_number, settings.number_width)
@@ -454,9 +464,8 @@ fn nl<T: Read>(reader: &mut BufReader<T>, stats: &mut Stats, settings: &Settings
                     .map_err_context(|| translate!("nl-error-could-not-write"))?;
                 stats.line_number = line_number.checked_add(settings.line_increment);
             } else {
-                let prefix = " ".repeat(settings.number_width + 1);
                 writer
-                    .write_all(prefix.as_bytes())
+                    .write_all(&blank_prefix)
                     .map_err_context(|| translate!("nl-error-could-not-write"))?;
             }
             write_line(&mut writer, &line)

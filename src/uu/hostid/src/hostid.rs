@@ -6,13 +6,14 @@
 // spell-checker:ignore (ToDO) gethostid
 
 use clap::Command;
-use libc::{c_long, gethostid};
+use core::ffi::c_long;
+use libc::gethostid;
 use std::io::{Write, stdout};
 use uucore::{error::UResult, format_usage};
 
 use uucore::translate;
 
-#[uucore::main]
+#[uucore::main(no_signals)]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     uucore::clap_localization::handle_clap_result(uu_app(), args)?;
     /*
@@ -21,10 +22,7 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
      * is a no-op unless unsigned int is wider than 32 bits.
      */
 
-    let mut result: c_long;
-    unsafe {
-        result = gethostid();
-    }
+    let mut result: c_long = unsafe { gethostid() };
 
     #[allow(overflowing_literals)]
     let mask = 0xffff_ffff;
@@ -35,9 +33,9 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
 }
 
 pub fn uu_app() -> Command {
-    Command::new(uucore::util_name())
+    Command::new("hostid")
         .version(uucore::crate_version!())
-        .help_template(uucore::localized_help_template(uucore::util_name()))
+        .help_template(uucore::localized_help_template("hostid"))
         .about(translate!("hostid-about"))
         .override_usage(format_usage(&translate!("hostid-usage")))
         .infer_long_args(true)

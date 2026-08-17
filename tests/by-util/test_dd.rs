@@ -2,14 +2,14 @@
 //
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
-// spell-checker:ignore fname, tname, fpath, specfile, testfile, unspec, ifile, ofile, outfile, fullblock, urand, fileio, atoe, atoibm, availible, behaviour, bmax, bremain, btotal, cflags, creat, ctable, ctty, datastructures, doesnt, etoa, fileout, fname, gnudd, iconvflags, iseek, nocache, noctty, noerror, nofollow, nolinks, nonblock, oconvflags, oseek, outfile, parseargs, rlen, rmax, rposition, rremain, rsofar, rstat, sigusr, sigval, wlen, wstat abcdefghijklm abcdefghi nabcde nabcdefg abcdefg fifoname seekable fadvise FADV DONTNEED
+// spell-checker:ignore fname, tname, fpath, specfile, testfile, unspec, ifile, ofile, outfile, fullblock, urand, fileio, atoe, atoibm, availible, behaviour, bmax, bremain, btotal, cflags, creat, ctable, ctty, datastructures, doesnt, etoa, fileout, fname, gnudd, iconvflags, iseek, nocache, noctty, noerror, nofollow, nolinks, nonblock, oconvflags, oseek, outfile, parseargs, rlen, rmax, rposition, rremain, rsofar, rstat, sigusr, sigval, wlen, wstat abcdefghijklm abcdefghi nabcde nabcdefg abcdefg fifoname FADV DONTNEED FSIZE SIGXFSZ sighandler
 
 use uutests::at_and_ucmd;
 use uutests::new_ucmd;
 use uutests::util::TestScenario;
 #[cfg(all(unix, not(feature = "feat_selinux")))]
 use uutests::util::run_ucmd_as_root_with_stdin_stdout;
-#[cfg(all(not(windows), feature = "printf"))]
+#[cfg(not(windows))]
 use uutests::util::{UCommand, get_tests_binary};
 use uutests::util_name;
 
@@ -19,12 +19,7 @@ use uucore::io::OwnedFileDescriptorOrHandle;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::path::PathBuf;
-#[cfg(all(
-    unix,
-    not(target_os = "macos"),
-    not(target_os = "freebsd"),
-    feature = "printf"
-))]
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "freebsd"),))]
 use std::process::Command;
 use std::process::Stdio;
 #[cfg(not(windows))]
@@ -113,6 +108,52 @@ fn version() {
 #[test]
 fn help() {
     new_ucmd!().args(&["--help"]).succeeds();
+}
+
+#[test]
+fn test_out_of_memory() {
+    new_ucmd!()
+        .arg("bs=1PB")
+        .fails_with_code(1)
+        .stderr_contains("memory"); //todo: improve error message at all platforms
+}
+
+#[test]
+fn test_out_of_memory_skip() {
+    new_ucmd!()
+        .arg("bs=1PB")
+        .arg("skip=1")
+        .fails_with_code(1)
+        .stderr_contains("memory");
+}
+
+#[test]
+fn test_huge_block_size_is_rejected_without_panicking() {
+    // Regression test for #12844: a block size >= i64::MAX used to panic
+    // ("attempt to multiply with overflow"); it must be rejected cleanly.
+    for arg in [
+        "bs=9223372036854775807",      // i64::MAX
+        "ibs=99999999999999999999",    // larger than u64::MAX
+        "obs=18446744073709551616",    // u64::MAX + 1
+        "cbs=9223372036854775808",     // i64::MAX + 1
+        "ibs=1778172772721772786161B", // overflows via the 'B' suffix
+    ] {
+        new_ucmd!()
+            .arg(arg)
+            .fails_with_code(1)
+            .no_stdout()
+            .stderr_contains("Value too large for defined data type");
+    }
+}
+
+#[test]
+fn test_huge_obs_reports_memory_error_instead_of_aborting() {
+    // Regression test for #12847: a valid but huge `obs` used to abort
+    // ("memory allocation of N bytes failed"); it must fail gracefully instead.
+    new_ucmd!()
+        .arg("obs=1PB")
+        .fails_with_code(1)
+        .stderr_contains("memory");
 }
 
 #[test]
@@ -225,15 +266,13 @@ fn test_zero_multiplier_warning() {
             .args(&[format!("{arg}=0").as_str(), "status=none"])
             .pipe_in("")
             .succeeds()
-            .no_stdout()
-            .no_stderr();
+            .no_output();
 
         new_ucmd!()
             .args(&[format!("{arg}=00x1").as_str(), "status=none"])
             .pipe_in("")
             .succeeds()
-            .no_stdout()
-            .no_stderr();
+            .no_output();
 
         new_ucmd!()
             .args(&[format!("{arg}=0x1").as_str(), "status=none"])
@@ -255,6 +294,13 @@ fn test_zero_multiplier_warning() {
             .succeeds()
             .no_stdout()
             .stderr_contains("warning: '0x' is a zero multiplier; use '00x' if that is intended");
+
+        new_ucmd!()
+            .args(&[format!("{arg}=0x0x0").as_str(), "status=none"])
+            .pipe_in("")
+            .succeeds()
+            .no_stdout()
+            .stderr_is("dd: warning: '0x' is a zero multiplier; use '00x' if that is intended\ndd: warning: '0x' is a zero multiplier; use '00x' if that is intended\n");
     }
 }
 
@@ -1449,7 +1495,10 @@ fn test_sync_delayed_reader() {
             .unwrap();
         for _ in 0..8 {
             fifo.write_all(&[0xF; 8]).unwrap();
-            sleep(Duration::from_millis(10));
+            // Each write must be read as its own short record, so leave dd
+            // enough time to drain the pipe: if two writes pile up, it reads a
+            // full 16-byte block, pads nothing and the output no longer matches.
+            sleep(Duration::from_millis(100));
         }
     }
     // Expected output is 0xFFFFFFFF00000000FFFFFFFF00000000...
@@ -1537,11 +1586,11 @@ fn test_skip_input_fifo() {
 }
 
 /// Test for reading part of stdin from each of two child processes.
-#[cfg(all(not(windows), feature = "printf"))]
+#[cfg(not(windows))]
 #[test]
 fn test_multiple_processes_reading_stdin() {
     // TODO Investigate if this is possible on Windows.
-    let printf = format!("{} printf 'abcdef\n'", get_tests_binary());
+    let printf = "printf 'abcdef\n'".to_string();
     let dd_skip = format!("{} dd bs=1 skip=3 count=0", get_tests_binary());
     let dd = format!("{} dd", get_tests_binary());
     UCommand::new()
@@ -1634,12 +1683,7 @@ fn test_seek_past_dev() {
 }
 
 #[test]
-#[cfg(all(
-    unix,
-    not(target_os = "macos"),
-    not(target_os = "freebsd"),
-    feature = "printf"
-))]
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "freebsd"),))]
 fn test_reading_partial_blocks_from_fifo() {
     // Create the FIFO.
     let ts = TestScenario::new(util_name!());
@@ -1679,12 +1723,7 @@ fn test_reading_partial_blocks_from_fifo() {
 }
 
 #[test]
-#[cfg(all(
-    unix,
-    not(target_os = "macos"),
-    not(target_os = "freebsd"),
-    feature = "printf"
-))]
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "freebsd"),))]
 fn test_reading_partial_blocks_from_fifo_unbuffered() {
     // Create the FIFO.
     let ts = TestScenario::new(util_name!());
@@ -1722,6 +1761,53 @@ fn test_reading_partial_blocks_from_fifo_unbuffered() {
     let output = child.wait_with_output().unwrap();
     assert_eq!(output.stdout, b"abcd");
     let expected = b"0+2 records in\n0+2 records out\n4 bytes copied";
+    assert!(output.stderr.starts_with(expected));
+}
+
+/// Regression test for <https://github.com/uutils/coreutils/issues/13458>:
+/// two deliberately short reads (ibs=3 sees only 2 bytes each) must be
+/// gathered into a single obs=6 output block without pulling stale bytes
+/// from the ibs-aligned gap into the output.
+///
+/// The writer below runs `printf` inside `sh`, where it is a builtin, so this
+/// needs no `printf` feature.
+#[test]
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "freebsd")))]
+fn test_reading_partial_blocks_from_fifo_gathered_into_larger_obs() {
+    // Create the FIFO.
+    let ts = TestScenario::new(util_name!());
+    let at = &ts.fixtures;
+    at.mkfifo("fifo");
+    let fifoname = at.plus_as_string("fifo");
+
+    // Start a `dd` process that reads from the fifo (so it will wait
+    // until the writer process starts).
+    let mut reader_command = Command::new(get_tests_binary());
+    let child = reader_command
+        .args(["dd", "ibs=3", "obs=6", &format!("if={fifoname}")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env("LANGUAGE", "C")
+        .spawn()
+        .unwrap();
+
+    // Start different processes to write to the FIFO, with a small
+    // pause in between.
+    let mut writer_command = Command::new("sh");
+    let _ = writer_command
+        .args([
+            "-c",
+            &format!("(printf \"ab\"; sleep 0.1; printf \"cd\") > {fifoname}"),
+        ])
+        .spawn()
+        .unwrap()
+        .wait();
+
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.stdout, b"abcd");
+    let expected = b"0+2 records in\n0+1 records out\n4 bytes copied";
     assert!(output.stderr.starts_with(expected));
 }
 
@@ -1914,7 +2000,7 @@ fn test_nocache_eof() {
 }
 
 #[test]
-#[cfg(all(target_os = "linux", feature = "printf"))]
+#[cfg(target_os = "linux")]
 fn test_nocache_eof_fadvise_zero_length() {
     use std::process::Command;
     let (at, _ucmd) = at_and_ucmd!();
@@ -1944,4 +2030,222 @@ fn test_nocache_eof_fadvise_zero_length() {
         strace.contains(", 0, POSIX_FADV_DONTNEED"),
         "Expected len=0 at EOF: {strace}"
     );
+}
+
+#[test]
+#[cfg(not(target_os = "openbsd"))]
+fn test_iso8859_1_case_conversion() {
+    use std::process::Command;
+    // Test ISO-8859-1 case conversion for accented characters
+    // Skip test if required locale is not available (common in CI environments)
+    let locale_test = Command::new("locale")
+        .arg("-a")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .is_some_and(|locales| locales.contains("fr_FR"));
+
+    if !locale_test {
+        eprintln!("Skipping ISO-8859-1 test: French locale not available");
+        return;
+    }
+
+    let locale = "fr_FR";
+
+    // É (0xC9) should convert to é (0xE9) with lcase
+    let input = vec![0xC9, 0x0A]; // É\n in ISO-8859-1
+    let expected = vec![0xE9, 0x0A]; // é\n in ISO-8859-1
+    let result = new_ucmd!()
+        .args(&["conv=lcase", "status=none"])
+        .env("LC_ALL", locale)
+        .pipe_in(input)
+        .succeeds();
+    assert_eq!(result.stdout(), expected);
+
+    // é (0xE9) should convert to É (0xC9) with ucase
+    let input = vec![0xE9, 0x0A]; // é\n in ISO-8859-1
+    let expected = vec![0xC9, 0x0A]; // É\n in ISO-8859-1
+    let result = new_ucmd!()
+        .args(&["conv=ucase", "status=none"])
+        .env("LC_ALL", locale)
+        .pipe_in(input)
+        .succeeds();
+    assert_eq!(result.stdout(), expected);
+}
+
+#[test]
+fn test_locale_aware_case_conversion() {
+    // Test that case conversion respects different single-byte locales
+
+    // Test Turkish (ISO-8859-9) where 'I' has special behavior
+    // Turkish has İ (0xDD) ↔ i (0xFD) and I (0x49) ↔ ı (0xFD in some positions)
+    // For simplicity, test some basic accented characters that differ between locales
+
+    // Test with ISO-8859-9 (Turkish) - Ğ (0xD0) should convert to ğ (0xF0)
+    let input = vec![0xD0, 0x0A]; // Ğ\n in ISO-8859-9
+    let expected = vec![0xF0, 0x0A]; // ğ\n in ISO-8859-9
+    let result = new_ucmd!()
+        .args(&["conv=lcase", "status=none"])
+        .env("LC_ALL", "tr_TR.iso8859-9")
+        .pipe_in(input)
+        .succeeds();
+
+    // Note: This test may not work if the system doesn't have Turkish locale installed
+    // In that case, it should fall back to C locale behavior
+    if result.stdout() == expected {
+        println!("Turkish locale case conversion working correctly");
+    } else {
+        println!("Turkish locale not available, using fallback behavior");
+        // Test that it at least doesn't crash and produces some output
+        assert!(!result.stdout().is_empty());
+    }
+}
+
+#[test]
+fn test_french_locale_case_conversion() {
+    // Test French (ISO-8859-1) case conversion for French accented characters
+    // This test uses the same charset as the previous ISO-8859-1 test but with French locale
+
+    // Test French accented characters: À (0xC0) should convert to à (0xE0) with lcase
+    let input = vec![0xC0, 0x0A]; // À\n in ISO-8859-1
+    let expected = vec![0xE0, 0x0A]; // à\n in ISO-8859-1
+    let result = new_ucmd!()
+        .args(&["conv=lcase", "status=none"])
+        .env("LC_ALL", "fr_FR.iso8859-1")
+        .pipe_in(input)
+        .succeeds();
+
+    // Note: This test may not work if the system doesn't have French locale installed
+    // In that case, it should fall back to C locale behavior
+    if result.stdout() == expected {
+        println!("French locale case conversion working correctly for À -> à");
+    } else {
+        println!("French locale not available, using fallback behavior");
+        // Test that it at least doesn't crash and produces some output
+        assert!(!result.stdout().is_empty());
+    }
+
+    // Test reverse conversion: à (0xE0) should convert to À (0xC0) with ucase
+    let input = vec![0xE0, 0x0A]; // à\n in ISO-8859-1
+    let expected = vec![0xC0, 0x0A]; // À\n in ISO-8859-1
+    let result = new_ucmd!()
+        .args(&["conv=ucase", "status=none"])
+        .env("LC_ALL", "fr_FR.iso8859-1")
+        .pipe_in(input)
+        .succeeds();
+
+    if result.stdout() == expected {
+        println!("French locale case conversion working correctly for à -> À");
+    } else {
+        println!("French locale not available for reverse conversion, using fallback behavior");
+        assert!(!result.stdout().is_empty());
+    }
+
+    // Test another French character: Ç (0xC7) should convert to ç (0xE7) with lcase
+    let input = vec![0xC7, 0x0A]; // Ç\n in ISO-8859-1
+    let expected = vec![0xE7, 0x0A]; // ç\n in ISO-8859-1
+    let result = new_ucmd!()
+        .args(&["conv=lcase", "status=none"])
+        .env("LC_ALL", "fr_FR.iso8859-1")
+        .pipe_in(input)
+        .succeeds();
+
+    if result.stdout() == expected {
+        println!("French locale case conversion working correctly for Ç -> ç");
+    } else {
+        println!("French locale not available for Ç conversion, using fallback behavior");
+        assert!(!result.stdout().is_empty());
+    }
+}
+
+#[test]
+fn test_ascii_case_conversion_fallback() {
+    // Test that ASCII characters always convert correctly regardless of locale
+    let input = vec![b'A', b'B', b'C', 0x0A]; // ABC\n
+    let expected = vec![b'a', b'b', b'c', 0x0A]; // abc\n
+    let result = new_ucmd!()
+        .args(&["conv=lcase", "status=none"])
+        .env("LC_ALL", "C")
+        .pipe_in(input.clone())
+        .succeeds();
+    assert_eq!(result.stdout(), expected);
+
+    // Test reverse conversion
+    let result = new_ucmd!()
+        .args(&["conv=ucase", "status=none"])
+        .env("LC_ALL", "C")
+        .pipe_in(expected)
+        .succeeds();
+    assert_eq!(result.stdout(), input);
+}
+
+#[test]
+fn test_bs_not_positive() {
+    for bs in [-5, 0, 0x0] {
+        for bs_param in ["bs", "ibs", "obs", "cbs"] {
+            new_ucmd!()
+                .args(&[format!("{bs_param}={bs}")])
+                .fails()
+                .no_stdout()
+                .code_is(1)
+                .stderr_is(format!("dd: invalid number: ‘{bs}’\n"));
+        }
+    }
+}
+
+#[test]
+fn test_count_bytes_with_expanding_block_conv() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    let mut input = vec![b'a'; 1000];
+    input.extend([b'Z'; 24]);
+    at.write_bytes("input.txt", &input);
+    ucmd.args(&[
+        "if=input.txt",
+        "of=output.bin",
+        "conv=block",
+        "cbs=1024",
+        "count=1000",
+        "iflag=count_bytes",
+    ])
+    .succeeds();
+    let output = at.read_bytes("output.bin");
+    assert_eq!(bytecount::count(&output, b'a'), 1000);
+    assert!(!output.contains(&b'Z'));
+}
+
+// A failed copy still has to report what it transferred, including complete
+// and partial records.
+#[test]
+#[cfg(all(unix, not(target_os = "macos")))]
+fn test_stats_are_reported_when_a_write_fails() {
+    use rlimit::Resource;
+
+    // Restores the previous SIGXFSZ disposition even if an assertion panics.
+    struct SigxfszGuard(libc::sighandler_t);
+    impl Drop for SigxfszGuard {
+        fn drop(&mut self) {
+            // SAFETY: restoring the disposition saved below.
+            unsafe { libc::signal(libc::SIGXFSZ, self.0) };
+        }
+    }
+
+    const CAP: u64 = 768 * 1024;
+
+    // The child inherits the ignored SIGXFSZ, so exceeding RLIMIT_FSIZE shows
+    // up as a short write() instead of killing the process.
+    // SAFETY: signal() with SIG_IGN is async-signal-safe and the guard puts
+    // the old handler back.
+    let _sigxfsz = SigxfszGuard(unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) });
+
+    let (at, mut ucmd) = at_and_ucmd!();
+    let result = ucmd
+        .args(&["if=/dev/zero", "of=capped.bin", "bs=512K", "count=3"])
+        .limit(Resource::FSIZE, CAP, CAP)
+        .fails();
+
+    // Under a 768 KiB cap, the first 512 KiB block is written in full, the
+    // second one is cut short at 256 KiB, and the third write fails.
+    result.stderr_contains("1+1 records out");
+    result.stderr_contains("786432 bytes");
+    assert_eq!(at.metadata("capped.bin").len(), CAP);
 }

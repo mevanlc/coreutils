@@ -29,7 +29,7 @@ use uucore::fsext::{FsUsage, MountInfo};
 /// [`Filesystem::usage`] field provides information on the amount of
 /// space available on the filesystem and the amount of space used.
 #[derive(Debug, Clone)]
-pub(crate) struct Filesystem {
+pub struct Filesystem {
     /// The file given on the command line if any.
     ///
     /// When invoking `df` with a positional argument, it displays
@@ -74,23 +74,15 @@ pub(crate) fn find_mount_point<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
     let mut current = path.as_ref().canonicalize()?;
     let current_dev = current.metadata()?.dev();
 
-    loop {
-        let parent = match current.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p,
-            _ => return Ok(current),
-        };
-
+    while let Some(parent) = current.parent().filter(|p| !p.as_os_str().is_empty()) {
         let parent_dev = parent.metadata()?.dev();
-        if parent_dev != current_dev {
-            return Ok(current);
-        }
-
-        if parent == current {
+        if parent_dev != current_dev || parent == current {
             return Ok(current);
         }
 
         current = parent.to_path_buf();
     }
+    Ok(current)
 }
 
 /// Find the mount info that best matches a given filesystem path.
@@ -134,8 +126,7 @@ where
         // make code more testable
         .map(|m| (m, std::fs::canonicalize(&m.dev_name)))
         // Ignore non existing paths
-        .filter(|m| m.1.is_ok())
-        .map(|m| (m.0, m.1.ok().unwrap()))
+        .filter_map(|m| m.1.ok().map(|m1| (m.0, m1)))
         // Try to find canonicalized device name corresponding to entered path
         .find(|m| m.1.eq(&path))
         .map(|m| m.0);
@@ -156,20 +147,20 @@ impl Filesystem {
         let stat_path = if mount_info.mount_dir.is_empty() {
             #[cfg(unix)]
             {
-                mount_info.dev_name.clone().into()
+                mount_info.dev_name.as_ref()
             }
             #[cfg(windows)]
             {
                 // On windows, we expect the volume id
-                mount_info.dev_id.clone().into()
+                mount_info.dev_id.as_ref()
             }
         } else {
-            mount_info.mount_dir.clone()
+            mount_info.mount_dir.as_os_str()
         };
         #[cfg(unix)]
-        let usage = FsUsage::new(statfs(&stat_path).ok()?);
+        let usage = FsUsage::new(statfs(stat_path).ok()?);
         #[cfg(windows)]
-        let usage = FsUsage::new(Path::new(&stat_path)).ok()?;
+        let usage = FsUsage::new(Path::new(stat_path)).ok()?;
         Some(Self {
             file,
             mount_info,
@@ -234,12 +225,10 @@ impl Filesystem {
     where
         P: AsRef<Path>,
     {
-        let file = path.as_ref().as_os_str().to_owned();
+        let path = path.as_ref();
+        let file = path.as_os_str().to_owned();
 
-        let canonical_path = path
-            .as_ref()
-            .canonicalize()
-            .map_err(|_| FsError::InvalidPath)?;
+        let canonical_path = path.canonicalize().map_err(|_| FsError::InvalidPath)?;
 
         let stat_result = statfs(canonical_path.as_os_str()).map_err(|_| FsError::MountMissing)?;
         let mount_dir = find_mount_point(&canonical_path).map_err(|_| FsError::MountMissing)?;

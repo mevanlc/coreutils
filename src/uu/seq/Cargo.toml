@@ -4,7 +4,6 @@ name = "uu_seq"
 description = "seq ~ (uutils) display a sequence of numbers"
 repository = "https://github.com/uutils/coreutils/tree/main/src/uu/seq"
 version.workspace = true
-authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 keywords.workspace = true
@@ -13,11 +12,9 @@ edition.workspace = true
 rust-version.workspace = true
 readme.workspace = true
 
-[lints]
-workspace = true
-
 [lib]
 path = "src/seq.rs"
+doctest = false
 
 [dependencies]
 bigdecimal = { workspace = true }
@@ -42,6 +39,9 @@ path = "src/main.rs"
 [dev-dependencies]
 divan = { workspace = true }
 uucore = { workspace = true, features = ["benchmark"] }
+
+[lints]
+workspace = true
 
 [[bench]]
 name = "seq_bench"

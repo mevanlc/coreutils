@@ -4,15 +4,13 @@
 // file that was distributed with this source code.
 
 // spell-checker:ignore (clap) dont
-// spell-checker:ignore (ToDO) formatteriteminfo inputdecoder inputoffset mockstream nrofbytes partialreader odfunc multifile exitcode
+// spell-checker:ignore (ToDO) formatteriteminfo inputdecoder inputoffset nrofbytes partialreader odfunc multifile exitcode
 // spell-checker:ignore Anone bfloat
 
 mod byteorder_io;
 mod formatter_item_info;
 mod input_decoder;
 mod input_offset;
-#[cfg(test)]
-mod mockstream;
 mod multifile_reader;
 mod output_info;
 mod parse_formats;
@@ -26,7 +24,7 @@ mod prn_int;
 
 use std::cmp;
 use std::fmt::Write;
-use std::io::{BufReader, Read, Write as IoWrite};
+use std::io::{BufReader, Read};
 
 use crate::byteorder_io::ByteOrder;
 use crate::formatter_item_info::FormatWriter;
@@ -132,38 +130,35 @@ impl OdOptions {
 
         let formats = parse_format_flags(args).map_err(|e| USimpleError::new(1, e))?;
 
-        let mut line_bytes = match matches.get_one::<String>(options::WIDTH) {
-            None => 16,
-            Some(s) => {
-                if matches.value_source(options::WIDTH) == Some(ValueSource::CommandLine) {
-                    let width_display = option_display_name(args, options::WIDTH, Some('w'));
-                    let parsed = parse_number_of_bytes(s).map_err(|e| {
-                        USimpleError::new(1, format_error_message(&e, s, &width_display))
-                    })?;
-                    if parsed == 0 {
-                        return Err(USimpleError::new(
-                            1,
-                            translate!(
-                                "od-error-invalid-argument",
-                                "option" => width_display.clone(),
-                                "value" => s.quote()
-                            ),
-                        ));
-                    }
-                    usize::try_from(parsed).map_err(|_| {
-                        USimpleError::new(
-                            1,
-                            translate!(
-                                "od-error-argument-too-large",
-                                "option" => width_display.clone(),
-                                "value" => s.quote()
-                            ),
-                        )
-                    })?
-                } else {
-                    16
-                }
+        let mut line_bytes = if let (Some(s), Some(ValueSource::CommandLine)) = (
+            matches.get_one::<String>(options::WIDTH),
+            matches.value_source(options::WIDTH),
+        ) {
+            let width_display = option_display_name(args, options::WIDTH, Some('w'));
+            let parsed = parse_number_of_bytes(s)
+                .map_err(|e| USimpleError::new(1, format_error_message(&e, s, &width_display)))?;
+            if parsed == 0 {
+                return Err(USimpleError::new(
+                    1,
+                    translate!(
+                        "od-error-invalid-argument",
+                        "option" => width_display.clone(),
+                        "value" => s.quote()
+                    ),
+                ));
             }
+            usize::try_from(parsed).map_err(|_| {
+                USimpleError::new(
+                    1,
+                    translate!(
+                        "od-error-argument-too-large",
+                        "option" => width_display.clone(),
+                        "value" => s.quote()
+                    ),
+                )
+            })?
+        } else {
+            16
         };
 
         let min_bytes = formats.iter().fold(1, |max, next| {
@@ -266,7 +261,7 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
             &od_options.input_strings,
             od_options.skip_bytes,
             od_options.read_bytes,
-        );
+        )?;
         let mut input_decoder = InputDecoder::new(
             &mut input,
             od_options.line_bytes,
@@ -290,9 +285,9 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
 }
 
 pub fn uu_app() -> Command {
-    Command::new(uucore::util_name())
+    Command::new("od")
         .version(uucore::crate_version!())
-        .help_template(uucore::localized_help_template(uucore::util_name()))
+        .help_template(uucore::localized_help_template("od"))
         .about(translate!("od-about"))
         .override_usage(format_usage(&translate!("od-usage")))
         .after_help(translate!("od-after-help"))
@@ -496,16 +491,16 @@ pub fn uu_app() -> Command {
         )
 }
 
-/// Loops through the input line by line, calling `print_bytes` to take care of the output.
+/// Loops through the input line by line, calling `write_bytes` to take care of the output.
 fn odfunc<I, W>(
     input_offset: &mut InputOffset,
     input_decoder: &mut InputDecoder<I>,
     output_info: &OutputInfo,
-    out: &mut W,
+    writer: &mut W,
 ) -> UResult<()>
 where
     I: PeekRead + HasError,
-    W: IoWrite,
+    W: std::io::Write,
 {
     let mut duplicate_line = false;
     let mut previous_bytes: Vec<u8> = Vec::new();
@@ -520,7 +515,7 @@ where
 
                 if length == 0 {
                     if !input_decoder.has_error() {
-                        input_offset.print_final_offset(out)?;
+                        input_offset.write_final_offset(writer)?;
                     }
                     break;
                 }
@@ -542,7 +537,7 @@ where
                 {
                     if !duplicate_line {
                         duplicate_line = true;
-                        writeln!(out, "*")?;
+                        writeln!(writer, "*")?;
                     }
                 } else {
                     duplicate_line = false;
@@ -551,11 +546,11 @@ where
                         memory_decoder.clone_buffer(&mut previous_bytes);
                     }
 
-                    print_bytes(
+                    write_bytes(
+                        writer,
                         &input_offset.format_byte_offset(),
                         &memory_decoder,
                         output_info,
-                        out,
                     )?;
                 }
 
@@ -563,7 +558,7 @@ where
             }
             Err(e) => {
                 show_error!("{e}");
-                input_offset.print_final_offset(out)?;
+                input_offset.write_final_offset(writer)?;
                 return Err(1.into());
             }
         }
@@ -583,7 +578,7 @@ fn extract_strings_from_input(
     read_bytes: Option<u64>,
     min_length: usize,
     radix: Radix,
-    out: &mut impl IoWrite,
+    writer: &mut impl std::io::Write,
 ) -> UResult<()> {
     let inputs = map_input_strings(input_strings);
     let mut mf = MultifileReader::new(inputs);
@@ -594,9 +589,8 @@ fn extract_strings_from_input(
         let to_skip = cmp::min(8192, skip_bytes - skipped);
         let mut skip_buf = vec![0u8; to_skip as usize];
         match mf.read(&mut skip_buf) {
-            Ok(0) => break, // EOF reached
+            Ok(0) | Err(_) => break, // 0 is EOF
             Ok(n) => skipped += n as u64,
-            Err(_) => break,
         }
     }
 
@@ -604,10 +598,10 @@ fn extract_strings_from_input(
     let mut print_string = |offset: u64, string: &[u8]| -> std::io::Result<()> {
         let string_content = String::from_utf8_lossy(string);
         match radix {
-            Radix::NoPrefix => writeln!(out, "{string_content}"),
-            Radix::Decimal => writeln!(out, "{offset:07} {string_content}"),
-            Radix::Hexadecimal => writeln!(out, "{offset:07x} {string_content}"),
-            Radix::Octal => writeln!(out, "{offset:07o} {string_content}"),
+            Radix::NoPrefix => writeln!(writer, "{string_content}"),
+            Radix::Decimal => writeln!(writer, "{offset:07} {string_content}"),
+            Radix::Hexadecimal => writeln!(writer, "{offset:07x} {string_content}"),
+            Radix::Octal => writeln!(writer, "{offset:07o} {string_content}"),
         }
     };
 
@@ -619,15 +613,13 @@ fn extract_strings_from_input(
 
     loop {
         // Check if we've reached the read_bytes limit
-        if let Some(limit) = read_bytes {
-            if bytes_read >= limit {
-                // Special case: when -N limit is reached with a pending string
-                // that meets min_length, output it even without null terminator
-                if current_string.len() >= min_length {
-                    print_string(string_start_offset, &current_string)?;
-                }
-                break;
+        if read_bytes.is_some_and(|l| bytes_read >= l) {
+            // Special case: when -N limit is reached with a pending string
+            // that meets min_length, output it even without null terminator
+            if current_string.len() >= min_length {
+                print_string(string_start_offset, &current_string)?;
             }
+            break;
         }
 
         // Read one byte at a time
@@ -677,11 +669,11 @@ fn extract_strings_from_input(
 }
 
 /// Outputs a single line of input, into one or more lines human readable output.
-fn print_bytes<W: IoWrite>(
+fn write_bytes(
+    writer: &mut impl std::io::Write,
     prefix: &str,
     input_decoder: &MemoryDecoder,
     output_info: &OutputInfo,
-    out: &mut W,
 ) -> std::io::Result<()> {
     let mut first = true; // First line of a multi-format raster.
     for f in output_info.spaced_formatters_iter() {
@@ -726,25 +718,21 @@ fn print_bytes<W: IoWrite>(
             let missing_spacing = output_info
                 .print_width_line
                 .saturating_sub(output_text.chars().count());
-            write!(
-                output_text,
-                "{:>missing_spacing$}  {}",
-                "",
-                format_ascii_dump(input_decoder.get_buffer(0)),
-            )
-            .unwrap();
+            output_text.extend(std::iter::repeat_n(' ', missing_spacing));
+            output_text.push_str("  ");
+            output_text.push_str(&format_ascii_dump(input_decoder.get_buffer(0)));
         }
 
         if first {
-            write!(out, "{prefix}")?; // print offset
+            write!(writer, "{prefix}")?; // print offset
             // if printing in multiple formats offset is printed only once
             first = false;
         } else {
             // this takes the space of the file offset on subsequent
             // lines of multi-format rasters.
-            write!(out, "{:>width$}", "", width = prefix.chars().count())?;
+            write!(writer, "{:>width$}", "", width = prefix.chars().count())?;
         }
-        writeln!(out, "{output_text}")?;
+        writeln!(writer, "{output_text}")?;
     }
     Ok(())
 }
@@ -768,17 +756,19 @@ fn open_input_peek_reader(
     input_strings: &[String],
     skip_bytes: u64,
     read_bytes: Option<u64>,
-) -> PeekReader<BufReader<PartialReader<MultifileReader<'_>>>> {
+) -> UResult<PeekReader<BufReader<PartialReader<MultifileReader<'_>>>>> {
     // should return  "impl PeekRead + Read + HasError" when supported in (stable) rust
     let inputs = map_input_strings(input_strings);
-    let mf = MultifileReader::new(inputs);
-    let pr = PartialReader::new(mf, skip_bytes, read_bytes);
+    let mut mf = MultifileReader::new(inputs);
+    mf.skip(skip_bytes)
+        .map_err(|e| USimpleError::new(1, e.to_string()))?;
+    let pr = PartialReader::new(mf, read_bytes);
     // Add a BufReader over the top of the PartialReader. This will have the
     // effect of generating buffered reads to files/stdin, but since these reads
     // go through MultifileReader (which limits the maximum number of bytes read)
     // we won't ever read more bytes than were specified with the `-N` flag.
     let buf_pr = BufReader::new(pr);
-    PeekReader::new(buf_pr)
+    Ok(PeekReader::new(buf_pr))
 }
 
 impl<R: HasError> HasError for BufReader<R> {

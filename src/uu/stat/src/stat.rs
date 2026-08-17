@@ -5,10 +5,13 @@
 // spell-checker:ignore datetime
 
 use uucore::error::{UError, UResult, USimpleError};
+use uucore::i18n::UEncoding;
+use uucore::quoting_style::{QuotingStyle as UucoreQuotingStyle, escape_name};
 use uucore::translate;
 
 use clap::builder::ValueParser;
 use uucore::display::Quotable;
+use uucore::error::strip_errno;
 use uucore::fs::{display_permissions, major, minor};
 use uucore::fsext::{
     FsMeta, MetadataTimeField, StatFs, metadata_get_time, pretty_filetype, pretty_fstype,
@@ -19,9 +22,10 @@ use uucore::{entries, format_usage, show_error, show_warning};
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::ffi::{OsStr, OsString};
 use std::fs::{FileType, Metadata};
-use std::io::Write;
+use std::io::{self, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::Path;
 use std::{env, fs};
@@ -43,8 +47,8 @@ enum StatError {
     StdinFilesystemMode,
     #[error("{}", translate!("stat-error-cannot-read-filesystem-info", "file" => file.clone(), "error" => error.clone()))]
     CannotReadFilesystemInfo { file: String, error: String },
-    #[error("{}", translate!("stat-error-cannot-stat", "file" => file.clone(), "error" => error.clone()))]
-    CannotStat { file: String, error: String },
+    #[error("{}", translate!("stat-error-cannot-statx", "file" => file.clone(), "error" => error.clone()))]
+    CannotStatx { file: String, error: String },
 }
 
 impl UError for StatError {
@@ -79,10 +83,13 @@ struct Flags {
 /// where `beg` & `end` is the beginning and end index of sub-string, respectively
 fn check_bound(slice: &str, bound: usize, beg: usize, end: usize) -> UResult<()> {
     if end >= bound {
+        // `beg`/`end` are char indices, so take the directive by chars: byte-slicing
+        // `slice` could land mid-UTF-8 when a multibyte char precedes the directive.
+        let directive: String = slice.chars().skip(beg).take(end - beg).collect();
         return Err(USimpleError::new(
             1,
             StatError::InvalidDirective {
-                directive: slice[beg..end].quote().to_string(),
+                directive: directive.quote().to_string(),
             }
             .to_string(),
         ));
@@ -117,13 +124,13 @@ fn pad_and_print(result: &str, left: bool, width: usize, padding: Padding) {
 ///
 /// On Unix systems, this preserves non-UTF8 data by printing raw bytes
 /// On other platforms, falls back to lossy string conversion
-fn pad_and_print_bytes<W: Write>(
+fn write_padded_bytes<W: Write>(
     mut writer: W,
     bytes: &[u8],
     left: bool,
     width: usize,
     precision: Precision,
-) -> Result<(), std::io::Error> {
+) -> io::Result<()> {
     let display_bytes = match precision {
         Precision::Number(p) if p < bytes.len() => &bytes[..p],
         _ => bytes,
@@ -152,7 +159,7 @@ fn pad_and_print_bytes<W: Write>(
 /// write padding based on a writer W and n size
 /// writer is genric to be any buffer like: `std::io::stdout`
 /// n is the calculated padding size
-fn write_padding<W: Write>(writer: &mut W, n: usize) -> Result<(), std::io::Error> {
+fn write_padding<W: Write>(writer: &mut W, n: usize) -> io::Result<()> {
     for _ in 0..n {
         writer.write_all(b" ")?;
     }
@@ -306,7 +313,8 @@ struct Stater {
     show_fs: bool,
     from_user: bool,
     files: Vec<OsString>,
-    mount_list: Option<Vec<OsString>>,
+    mount_list: OnceCell<Option<Vec<OsString>>>,
+    mount_list_needed: bool,
     default_tokens: Vec<Token>,
     default_dev_tokens: Vec<Token>,
 }
@@ -397,11 +405,8 @@ fn determine_padding_char(flags: Flags) -> Padding {
 /// * `width` - The width of the field for the printed string.
 /// * `precision` - How many digits of precision, if any.
 fn print_str(s: &str, flags: Flags, width: usize, precision: Precision) {
-    let s = match precision {
-        Precision::Number(p) if p < s.len() => &s[..p],
-        _ => s,
-    };
-    pad_and_print(s, flags.left, width, Padding::Space);
+    // Truncate and pad on the byte representation, so a precision that lands inside a multibyte character does not cause a panic.
+    let _ = write_padded_bytes(io::stdout(), s.as_bytes(), flags.left, width, precision);
 }
 
 /// Prints a `OsString` value based on the provided flags, width, and precision.
@@ -422,7 +427,7 @@ fn print_os_str(s: &OsString, flags: Flags, width: usize, precision: Precision) 
 
         let bytes = s.as_bytes();
 
-        if pad_and_print_bytes(std::io::stdout(), bytes, flags.left, width, precision).is_err() {
+        if write_padded_bytes(io::stdout(), bytes, flags.left, width, precision).is_err() {
             // if an error occurred while trying to print bytes fall back to normal lossy string so it can be printed
             let fallback_string = s.to_string_lossy();
             print_str(&fallback_string, flags, width, precision);
@@ -441,11 +446,29 @@ fn quote_file_name(file_name: &str, quoting_style: &QuotingStyle) -> String {
             let escaped = file_name.replace('\'', r"\'");
             format!("'{escaped}'")
         }
-        QuotingStyle::ShellEscapeAlways => {
-            let quote = if file_name.contains('\'') { '"' } else { '\'' };
-            format!("{quote}{file_name}{quote}")
-        }
+        QuotingStyle::ShellEscapeAlways => escape_name(
+            OsStr::new(file_name),
+            UucoreQuotingStyle::Shell {
+                escape: true,
+                always_quote: true,
+                show_control: true,
+            },
+            UEncoding::Utf8,
+        )
+        .to_string_lossy()
+        .to_string(),
         QuotingStyle::Quote => file_name.to_string(),
+    }
+}
+
+fn warn_invalid_quoting_style(style: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        show_error!(
+            "{}",
+            translate!("stat-warning-invalid-env-quoting-style", "style" => style.to_string())
+        );
     }
 }
 
@@ -455,10 +478,15 @@ fn get_quoted_file_name(
     file_type: FileType,
     from_user: bool,
 ) -> Result<String, i32> {
-    let quoting_style = env::var("QUOTING_STYLE")
-        .ok()
-        .and_then(|style| style.parse().ok())
-        .unwrap_or_default();
+    let quoting_style = match env::var("QUOTING_STYLE") {
+        Ok(style) => style.parse().unwrap_or_else(|_| {
+            // Match GNU coreutils 9.11: warn (once) when QUOTING_STYLE is set
+            // to a value we don't understand, then fall back to the default.
+            warn_invalid_quoting_style(&style);
+            QuotingStyle::default()
+        }),
+        Err(_) => QuotingStyle::default(),
+    };
 
     if file_type.is_symlink() {
         let quoted_display_name = quote_file_name(display_name, &quoting_style);
@@ -484,7 +512,7 @@ fn get_quoted_file_name(
 
 fn process_token_filesystem(t: &Token, meta: &StatFs, display_name: &str) {
     match *t {
-        Token::Byte(byte) => write_raw_byte(byte),
+        Token::Byte(byte) => print_raw_byte(byte),
         Token::Char(c) => print!("{c}"),
         Token::Directive {
             flag,
@@ -555,8 +583,7 @@ fn print_integer(
         ""
     };
     let extended = match precision {
-        Precision::NotSpecified => format!("{prefix}{arg}"),
-        Precision::NoNumber => format!("{prefix}{arg}"),
+        Precision::NotSpecified | Precision::NoNumber => format!("{prefix}{arg}"),
         Precision::Number(p) => format!("{prefix}{arg:0>p$}"),
     };
     pad_and_print(&extended, flags.left, width, padding_char);
@@ -587,13 +614,14 @@ fn precision_trunc(num: f64, precision: Precision) -> String {
     let num_str = num.to_string();
     let n = num_str.len();
     match (num_str.find('.'), precision) {
-        (None, Precision::NotSpecified) => num_str,
-        (None, Precision::NoNumber) => num_str,
-        (None, Precision::Number(0)) => num_str,
+        (None, Precision::NotSpecified)
+        | (None, Precision::NoNumber)
+        | (None, Precision::Number(0))
+        | (Some(_), Precision::NoNumber) => num_str,
         (None, Precision::Number(p)) => format!("{num_str}.{zeros}", zeros = "0".repeat(p)),
-        (Some(i), Precision::NotSpecified) => num_str[..i].to_string(),
-        (Some(_), Precision::NoNumber) => num_str,
-        (Some(i), Precision::Number(0)) => num_str[..i].to_string(),
+        (Some(i), Precision::NotSpecified) | (Some(i), Precision::Number(0)) => {
+            num_str[..i].to_string()
+        }
         (Some(i), Precision::Number(p)) if p < n - i => num_str[..i + 1 + p].to_string(),
         (Some(i), Precision::Number(p)) => {
             format!("{num_str}{zeros}", zeros = "0".repeat(p - (n - i - 1)))
@@ -637,8 +665,7 @@ fn print_unsigned(
         Cow::Borrowed(num.as_str())
     };
     let s = match precision {
-        Precision::NotSpecified => s,
-        Precision::NoNumber => s,
+        Precision::NotSpecified | Precision::NoNumber => s,
         Precision::Number(p) => format!("{s:0>p$}").into(),
     };
     pad_and_print(&s, flags.left, width, padding_char);
@@ -662,8 +689,7 @@ fn print_unsigned_oct(
 ) {
     let prefix = if flags.alter { "0" } else { "" };
     let s = match precision {
-        Precision::NotSpecified => format!("{prefix}{num:o}"),
-        Precision::NoNumber => format!("{prefix}{num:o}"),
+        Precision::NotSpecified | Precision::NoNumber => format!("{prefix}{num:o}"),
         Precision::Number(p) => format!("{prefix}{num:0>p$o}"),
     };
     pad_and_print(&s, flags.left, width, padding_char);
@@ -687,20 +713,20 @@ fn print_unsigned_hex(
 ) {
     let prefix = if flags.alter { "0x" } else { "" };
     let s = match precision {
-        Precision::NotSpecified => format!("{prefix}{num:x}"),
-        Precision::NoNumber => format!("{prefix}{num:x}"),
+        Precision::NotSpecified | Precision::NoNumber => format!("{prefix}{num:x}"),
         Precision::Number(p) => format!("{prefix}{num:0>p$x}"),
     };
     pad_and_print(&s, flags.left, width, padding_char);
 }
 
-fn write_raw_byte(byte: u8) {
-    std::io::stdout().write_all(&[byte]).unwrap();
+fn print_raw_byte(byte: u8) {
+    io::stdout().write_all(&[byte]).unwrap();
 }
 
 impl Stater {
     fn process_flags(chars: &[char], i: &mut usize, bound: usize, flag: &mut Flags) {
         while *i < bound {
+            #[expect(clippy::match_same_arms)] // needs comment
             match chars[*i] {
                 '#' => flag.alter = true,
                 '0' => flag.zero = true,
@@ -791,21 +817,20 @@ impl Stater {
         *i = j;
 
         // Check for multi-character specifiers (e.g., `%Hd`, `%Lr`)
-        if *i + 1 < bound {
-            if let Some(&next_char) = chars.get(*i + 1) {
-                if (chars[*i] == 'H' || chars[*i] == 'L') && (next_char == 'd' || next_char == 'r')
-                {
-                    flag.major = chars[*i] == 'H';
-                    flag.minor = chars[*i] == 'L';
-                    *i += 1;
-                    return Ok(Token::Directive {
-                        flag,
-                        width,
-                        precision,
-                        format: next_char,
-                    });
-                }
-            }
+        if *i + 1 < bound
+            && let Some(&next_char) = chars.get(*i + 1).filter(|c| **c == 'd' || **c == 'r')
+            && (chars[*i] == 'H' || chars[*i] == 'L')
+        {
+            let is_major = chars[*i] == 'H';
+            flag.major = is_major;
+            flag.minor = !is_major; // chars[*i] == 'L'
+            *i += 1;
+            return Ok(Token::Directive {
+                flag,
+                width,
+                precision,
+                format: next_char,
+            });
         }
 
         Ok(Token::Directive {
@@ -964,42 +989,53 @@ impl Stater {
 
         // mount points aren't displayed when showing filesystem information, or
         // whenever the format string does not request the mount point.
-        let mount_list = if show_fs
-            || !default_tokens
+        let mount_list_needed = !show_fs
+            && default_tokens
                 .iter()
-                .any(|tok| matches!(tok, Token::Directive { format: 'm', .. }))
-        {
-            None
-        } else {
-            Some(Self::populate_mount_list()?)
-        };
+                .any(|tok| matches!(tok, Token::Directive { format: 'm', .. }));
 
         Ok(Self {
             follow: matches.get_flag(options::DEREFERENCE),
             show_fs,
             from_user: !format_str.is_empty(),
             files,
+            mount_list: OnceCell::new(),
+            mount_list_needed,
             default_tokens,
             default_dev_tokens,
-            mount_list,
         })
     }
 
     fn find_mount_point<P: AsRef<Path>>(&self, p: P) -> Option<&OsString> {
+        if !self.mount_list_needed {
+            return None;
+        }
+
+        let mount_list = self.mount_list.get_or_init(|| {
+            match Self::populate_mount_list() {
+                Ok(list) => Some(list),
+                Err(e) => {
+                    // Show warning like GNU does when mount information cannot be read
+                    show_warning!(
+                        "{}",
+                        translate!("stat-error-cannot-read-filesystem", "error" => e.to_string())
+                    );
+                    None
+                }
+            }
+        });
+
         let path = p.as_ref().canonicalize().ok()?;
-        self.mount_list
+        mount_list
             .as_ref()?
             .iter()
             .find(|root| path.starts_with(root))
     }
 
     fn exec(&self) -> i32 {
-        let mut stdin_is_fifo = false;
-        if cfg!(unix) {
-            if let Ok(md) = fs::metadata("/dev/stdin") {
-                stdin_is_fifo = md.file_type().is_fifo();
-            }
-        }
+        #[cfg(unix)]
+        let stdin_is_fifo = rustix::fs::fstat(io::stdin())
+            .is_ok_and(|s| rustix::fs::FileType::from_raw_mode(s.st_mode).is_fifo());
 
         let mut ret = 0;
         for f in &self.files {
@@ -1017,12 +1053,16 @@ impl Stater {
         file: &OsString,
         file_type: FileType,
         from_user: bool,
-        #[cfg(feature = "selinux")] follow_symbolic_links: bool,
-        #[cfg(not(feature = "selinux"))] _: bool,
+        #[cfg(all(feature = "selinux", any(target_os = "linux", target_os = "android")))]
+        follow_symbolic_links: bool,
+        #[cfg(not(all(feature = "selinux", any(target_os = "linux", target_os = "android"))))]
+        _: bool,
     ) -> Result<(), i32> {
         match *t {
-            Token::Byte(byte) => write_raw_byte(byte),
-            Token::Char(c) => print!("{c}"),
+            Token::Byte(byte) => print_raw_byte(byte),
+            Token::Char(c) => io::stdout()
+                .write_all(c.to_string().as_bytes())
+                .map_err(|_| 1)?,
 
             Token::Directive {
                 flag,
@@ -1241,9 +1281,9 @@ impl Stater {
                 Err(e) => {
                     show_error!(
                         "{}",
-                        StatError::CannotStat {
+                        StatError::CannotStatx {
                             file: display_name.quote().to_string(),
-                            error: e.to_string()
+                            error: strip_errno(&e)
                         }
                     );
                     return 1;
@@ -1335,9 +1375,9 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
 }
 
 pub fn uu_app() -> Command {
-    Command::new(uucore::util_name())
+    Command::new("stat")
         .version(uucore::crate_version!())
-        .help_template(uucore::localized_help_template(uucore::util_name()))
+        .help_template(uucore::localized_help_template("stat"))
         .about(translate!("stat-about"))
         .after_help(translate!("stat-after-help"))
         .override_usage(format_usage(&translate!("stat-usage")))
@@ -1405,7 +1445,7 @@ fn pretty_time(meta: &Metadata, md_time_field: MetadataTimeField) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::{pad_and_print_bytes, quote_file_name, write_padding};
+    use crate::{quote_file_name, write_padded_bytes, write_padding};
 
     use super::{Flags, Precision, ScanUtil, Stater, Token, group_num, precision_trunc};
 
@@ -1530,23 +1570,23 @@ mod tests {
     }
 
     #[test]
-    fn test_pad_and_print_bytes() {
+    fn test_write_padded_bytes() {
         // testing non-utf8 with normal settings
         let mut buffer = Vec::new();
         let bytes = b"\x80\xFF\x80";
-        pad_and_print_bytes(&mut buffer, bytes, false, 3, Precision::NotSpecified).unwrap();
+        write_padded_bytes(&mut buffer, bytes, false, 3, Precision::NotSpecified).unwrap();
         assert_eq!(&buffer, b"\x80\xFF\x80");
 
         // testing left padding
         let mut buffer = Vec::new();
         let bytes = b"\x80\xFF\x80";
-        pad_and_print_bytes(&mut buffer, bytes, false, 5, Precision::NotSpecified).unwrap();
+        write_padded_bytes(&mut buffer, bytes, false, 5, Precision::NotSpecified).unwrap();
         assert_eq!(&buffer, b"  \x80\xFF\x80");
 
         // testing right padding
         let mut buffer = Vec::new();
         let bytes = b"\x80\xFF\x80";
-        pad_and_print_bytes(&mut buffer, bytes, true, 5, Precision::NotSpecified).unwrap();
+        write_padded_bytes(&mut buffer, bytes, true, 5, Precision::NotSpecified).unwrap();
         assert_eq!(&buffer, b"\x80\xFF\x80  ");
     }
 

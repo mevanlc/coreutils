@@ -12,7 +12,7 @@
 //! When the systemd-logind feature is enabled and systemd is available,
 //! this will be used instead of traditional utmp files.
 
-use std::ffi::CStr;
+use core::ffi::CStr;
 use std::mem::MaybeUninit;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -20,8 +20,7 @@ use crate::error::{UResult, USimpleError};
 
 /// FFI bindings for libsystemd login and D-Bus functions
 mod ffi {
-    use std::ffi::c_char;
-    use std::os::raw::{c_int, c_uint};
+    use core::ffi::{c_char, c_int, c_uint};
 
     #[link(name = "systemd")]
     unsafe extern "C" {
@@ -44,13 +43,14 @@ mod ffi {
 /// Safe wrapper functions for libsystemd FFI calls
 mod login {
     use super::ffi;
-    use std::ffi::{CStr, CString};
+    use core::ffi::CStr;
+    use std::ffi::CString;
     use std::ptr;
     use std::time::SystemTime;
 
     /// Get all active sessions
     pub fn get_sessions() -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        let mut sessions_ptr: *mut *mut libc::c_char = ptr::null_mut();
+        let mut sessions_ptr: *mut *mut core::ffi::c_char = ptr::null_mut();
 
         let result = unsafe { ffi::sd_get_sessions(&raw mut sessions_ptr) };
 
@@ -83,13 +83,13 @@ mod login {
     /// Get UID for a session
     pub fn get_session_uid(session_id: &str) -> Result<u32, Box<dyn std::error::Error>> {
         let session_cstring = CString::new(session_id)?;
-        let mut uid: std::os::raw::c_uint = 0;
+        let mut uid: core::ffi::c_uint = 0;
 
         let result = unsafe { ffi::sd_session_get_uid(session_cstring.as_ptr(), &raw mut uid) };
 
         if result < 0 {
             return Err(
-                format!("sd_session_get_uid failed for session '{session_id}': {result}",).into(),
+                format!("sd_session_get_uid failed for session '{session_id}': {result}").into(),
             );
         }
 
@@ -117,13 +117,13 @@ mod login {
     /// Get TTY for a session
     pub fn get_session_tty(session_id: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
         let session_cstring = CString::new(session_id)?;
-        let mut tty_ptr: *mut libc::c_char = ptr::null_mut();
+        let mut tty_ptr: *mut core::ffi::c_char = ptr::null_mut();
 
         let result = unsafe { ffi::sd_session_get_tty(session_cstring.as_ptr(), &raw mut tty_ptr) };
 
         if result < 0 {
             return Err(
-                format!("sd_session_get_tty failed for session '{session_id}': {result}",).into(),
+                format!("sd_session_get_tty failed for session '{session_id}': {result}").into(),
             );
         }
 
@@ -144,7 +144,7 @@ mod login {
         session_id: &str,
     ) -> Result<Option<String>, Box<dyn std::error::Error>> {
         let session_cstring = CString::new(session_id)?;
-        let mut host_ptr: *mut libc::c_char = ptr::null_mut();
+        let mut host_ptr: *mut core::ffi::c_char = ptr::null_mut();
 
         let result =
             unsafe { ffi::sd_session_get_remote_host(session_cstring.as_ptr(), &raw mut host_ptr) };
@@ -173,7 +173,7 @@ mod login {
         session_id: &str,
     ) -> Result<Option<String>, Box<dyn std::error::Error>> {
         let session_cstring = CString::new(session_id)?;
-        let mut display_ptr: *mut libc::c_char = ptr::null_mut();
+        let mut display_ptr: *mut core::ffi::c_char = ptr::null_mut();
 
         let result =
             unsafe { ffi::sd_session_get_display(session_cstring.as_ptr(), &raw mut display_ptr) };
@@ -202,14 +202,14 @@ mod login {
         session_id: &str,
     ) -> Result<Option<String>, Box<dyn std::error::Error>> {
         let session_cstring = CString::new(session_id)?;
-        let mut type_ptr: *mut libc::c_char = ptr::null_mut();
+        let mut type_ptr: *mut core::ffi::c_char = ptr::null_mut();
 
         let result =
             unsafe { ffi::sd_session_get_type(session_cstring.as_ptr(), &raw mut type_ptr) };
 
         if result < 0 {
             return Err(
-                format!("sd_session_get_type failed for session '{session_id}': {result}",).into(),
+                format!("sd_session_get_type failed for session '{session_id}': {result}").into(),
             );
         }
 
@@ -230,14 +230,14 @@ mod login {
         session_id: &str,
     ) -> Result<Option<String>, Box<dyn std::error::Error>> {
         let session_cstring = CString::new(session_id)?;
-        let mut seat_ptr: *mut libc::c_char = ptr::null_mut();
+        let mut seat_ptr: *mut core::ffi::c_char = ptr::null_mut();
 
         let result =
             unsafe { ffi::sd_session_get_seat(session_cstring.as_ptr(), &raw mut seat_ptr) };
 
         if result < 0 {
             return Err(
-                format!("sd_session_get_seat failed for session '{session_id}': {result}",).into(),
+                format!("sd_session_get_seat failed for session '{session_id}': {result}").into(),
             );
         }
 
@@ -309,8 +309,8 @@ impl SystemdLoginRecord {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
         let ts_nanos: i128 = (duration.as_nanos()).try_into().unwrap_or(0);
-        let local_offset =
-            time::OffsetDateTime::now_local().map_or_else(|_| time::UtcOffset::UTC, |v| v.offset());
+        let local_offset = time::OffsetDateTime::now_local()
+            .map_or_else(|_| time::UtcOffset::UTC, time::OffsetDateTime::offset);
         time::OffsetDateTime::from_unix_timestamp_nanos(ts_nanos)
             .unwrap_or_else(|_| {
                 time::OffsetDateTime::now_local()
