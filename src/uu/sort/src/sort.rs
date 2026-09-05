@@ -823,39 +823,24 @@ impl<'a> Line<'a> {
 
         for (i, &byte) in line.iter().enumerate() {
             let desired_bg = bg_colors[i];
-            let desired_fg = target_fg;
+            let desired_fg = desired_bg.map_or(target_fg, |_| Some(97));
 
             if desired_fg != current_fg || desired_bg != current_bg {
-                match (desired_fg, desired_bg) {
-                    (None, None) => {
-                        write!(writer, "\x1b[0m")?;
-                    }
-                    (Some(fg), None) => {
-                        if current_bg.is_some() {
-                            write!(writer, "\x1b[49m")?;
-                        }
-                        if current_fg != Some(fg) {
-                            write!(writer, "\x1b[{fg}m")?;
-                        }
-                    }
-                    (None, Some(bg)) => {
-                        if current_fg.is_some() {
-                            write!(writer, "\x1b[39m")?;
-                        }
-                        if current_bg != Some(bg) {
-                            write!(writer, "\x1b[{bg}m")?;
-                        }
-                    }
-                    (Some(fg), Some(bg)) => {
-                        if current_fg == Some(fg) && current_bg != Some(bg) {
-                            write!(writer, "\x1b[{bg}m")?;
-                        } else if current_fg != Some(fg) && current_bg == Some(bg) {
-                            write!(writer, "\x1b[{fg}m")?;
-                        } else {
-                            write!(writer, "\x1b[{fg};{bg}m")?;
-                        }
-                    }
+                writer.write_all(b"\x1b[")?;
+                let mut needs_separator = false;
+
+                if desired_fg != current_fg {
+                    write!(writer, "{}", desired_fg.unwrap_or(39))?;
+                    needs_separator = true;
                 }
+                if desired_bg != current_bg {
+                    if needs_separator {
+                        writer.write_all(b";")?;
+                    }
+                    write!(writer, "{}", desired_bg.unwrap_or(49))?;
+                }
+                writer.write_all(b"m")?;
+
                 current_fg = desired_fg;
                 current_bg = desired_bg;
             }
